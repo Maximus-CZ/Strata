@@ -5393,12 +5393,15 @@ int main(int argc, char** argv) {
             }
             c.used = ++check_clock;
             checks.push_back(std::move(c));
-            while ((int) checks.size() > o.prompt_cache) {
+            // --prompt-cache 1 with a prefix cache: the root stays beside the newest point until the request's
+            // DONE has saved it to the prefix cache; the chain goes back to one point right after that
+            const int cap = (o.prompt_cache == 1 && prefixes.enabled()) ? 2 : o.prompt_cache;
+            while ((int) checks.size() > cap) {
                 std::vector<uint64_t> stamps;
                 stamps.reserve(checks.size());
                 for (const ConvCheckpoint& k : checks) stamps.push_back(k.used);
                 const size_t victim = strata::program::conv_cache::eviction_victim(stamps.data(), stamps.size(),
-                                                                                   o.prompt_cache);
+                                                                                   cap);
                 checks.erase(checks.begin() + (std::ptrdiff_t) victim);
             }
             return true;
@@ -7444,6 +7447,16 @@ int main(int argc, char** argv) {
                             err.clear();
                             break;
                         }
+            }
+            // --prompt-cache 1: the root held for the save above leaves; the chain keeps only its newest point
+            // (the system prompt comes back from the prefix cache)
+            if (o.prompt_cache == 1 && prefixes.enabled() && checks.size() > 1) {
+                size_t newest = 0;
+                for (size_t i = 1; i < checks.size(); ++i)
+                    if (checks[i].used > checks[newest].used) newest = i;
+                ConvCheckpoint keep = std::move(checks[newest]);
+                checks.clear();
+                checks.push_back(std::move(keep));
             }
             if (admit_slot >= 0) {   // --batch: BADM <slot> <1 = continues in the batch windows | 0 = done>
                 bool cont = !cancelled && produced_n == 1 && admit_max_new > 1 && std::strcmp(finish, "length") == 0 &&
