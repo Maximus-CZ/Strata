@@ -1274,10 +1274,20 @@ class Vision:
             args += ["--max-tokens", str(cfg["max_tokens"])]
         self.dir = Path(tempfile.mkdtemp(prefix="strata-vision-"))
         self.spawn = (args, log, env)                   # to start it again after an unload
-        self.stopped = False
-        self._start()
         self.lock = threading.Lock()
         self.cache: dict[str, tuple[Path, int]] = {}
+        # local patch: "lazy": true - a GPU encoder that is not resident.  It starts only for a picture that is not
+        # cached yet, after before_start(vram_mib) made the engine give that VRAM back (--vram-elastic), and stops
+        # right after the request's pictures are encoded; after_stop() lets the engine take its VRAM back.  Its
+        # weights stay in RAM between uses (the OS file cache of the mmproj file).
+        self.lazy = bool(cfg.get("lazy"))
+        self.vram_mib = int(cfg.get("vram_mib") or 2048)
+        self.before_start = None                        # set by the Service: engine.vram(reserve)
+        self.after_stop = None                          # set by the Service: engine.vram(None)
+        self.proc = None
+        self.stopped = True
+        if not self.lazy:
+            self._start()
 
     def _start(self):
         args, log, env = self.spawn
@@ -1290,7 +1300,17 @@ class Vision:
         self.stopped = False
 
     def alive(self) -> bool:
-        return not self.stopped and self.proc.poll() is None
+        return not self.stopped and self.proc is not None and self.proc.poll() is None
+
+    def release(self):
+        """local patch: a lazy encoder stops after a request's pictures and the engine takes its VRAM back."""
+        if not self.lazy or not self.alive():
+            return
+        t = time.time()
+        self.unload()
+        if self.after_stop:
+            self.after_stop()
+        print(f"[strata] vision encoder stopped, VRAM back to the engine ({time.time() - t:.2f} s)", flush=True)
 
     def unload(self):
         """Stop the encoder process (its VRAM or RAM goes back); the encoded images stay cached on disk."""
@@ -1300,7 +1320,8 @@ class Vision:
     def restart(self):
         """Start the encoder again after an unload (or if it died); the cache of encoded images is kept."""
         try:
-            self.proc.kill()
+            if self.proc is not None:
+                self.proc.kill()
         except OSError:
             pass
         self._start()
@@ -1354,6 +1375,14 @@ class Vision:
             if key in self.cache:
                 return self.cache[key]
             img, out = self.dir / f"{key}.img", self.dir / f"{key}.sve"
+            if self.lazy and not self.alive():          # local patch: VRAM from the engine, then the encoder
+                t = time.time()
+                if self.before_start:
+                    self.before_start(self.vram_mib)
+                t1 = time.time()
+                self._start()
+                print(f"[strata] vision encoder started on the GPU: engine gave {self.vram_mib} MiB back in "
+                      f"{t1 - t:.2f} s, encoder ready in {time.time() - t1:.2f} s", flush=True)
             img.write_bytes(data)
             try:
                 self.proc.stdin.write(f"ENC {img} {out}\n")
@@ -1371,6 +1400,8 @@ class Vision:
             return self.cache[key]
 
     def close(self):
+        if self.proc is None:
+            return
         try:
             self.proc.stdin.write("QUIT\n")
             self.proc.stdin.flush()
@@ -1652,6 +1683,23 @@ class Service:
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
                  fit_max_tokens: bool = False):
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
+        if vision is not None and getattr(vision, "lazy", False) and hasattr(engine, "vram"):
+            # local patch: the lazy GPU encoder borrows VRAM from the engine's expert cache (--vram-elastic); the
+            # caller holds self.fifo, so the engine is between requests
+            # back to exactly the VRAM that was free before (not the start's default reserve: at load the engine
+            # fills the card further, and VRAM None would leave ~20 % of the expert cache empty until a restart)
+            def lend(mib):
+                if getattr(self, "_vision_free_before", None) is None:   # once: later figures are after a regrow
+                    self._vision_free_before = self.free_vram_mib()
+                self.engine.vram(mib)
+
+            def take_back():
+                before = getattr(self, "_vision_free_before", None)
+                # a little under it: the regrow stops a segment short and the prompt path's buffers move (measured
+                # -165 slots at the same figure, 64 MiB segments)
+                self.engine.vram(max(256, int(before) - 128) if before else None)
+            vision.before_start = lend
+            vision.after_stop = take_back
         self.fit_max_tokens = fit_max_tokens          # --fit-max-tokens: clamp the output cap instead of 400
         self.aliases: list[str] = []                  # #297: other names of the model (the config's `aliases`)
         self.sampling_defaults = dict(sampling_defaults or {})   # the run config's `sampling` block
@@ -1750,6 +1798,8 @@ class Service:
         return value if value > 0 else None
 
     def _vision_down(self) -> bool:
+        if self.vision is not None and getattr(self.vision, "lazy", False):
+            return False                                # local patch: a lazy encoder is down on purpose
         return self.vision is not None and hasattr(self.vision, "alive") and not self.vision.alive()
 
     def free_vram_mib(self) -> int | None:
@@ -2159,7 +2209,11 @@ class Service:
             # "reading the prompt" with CPU and GPU busy, for good (reproduced).  So encoding takes its turn in the
             # same FIFO as the requests.
             with self.fifo:
-                encoded = [self.vision.encode(src) for src in images]
+                try:
+                    encoded = [self.vision.encode(src) for src in images]
+                finally:                                # local patch: a lazy encoder gives its VRAM back now
+                    if getattr(self.vision, "lazy", False):
+                        self.vision.release()
             # one <|image_pad|> per image -> one per image token.  Only the markers the template writes for an image
             # (right after <|vision_start|>) are images: the same text inside a message (an agent reading these docs,
             # #150) is kept as plain text, or it took an image's place and the counts no longer matched.
