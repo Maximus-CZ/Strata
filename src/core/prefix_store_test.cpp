@@ -170,11 +170,11 @@ void prefix_session(int fmt, int mode, const std::string& dir) {
         PrefixStore store;
         check(store.open(o,log,err) && store.size()==0,"open empty directory");
         check(store.capture(root,true,ss,g,draft.state,log,err) && store.size()==1,"capture straight to disk");
-        check(store.contains(root.ids,true) && !store.contains(root.ids,false),"cvec is part of the identity");
-        check(store.best(ids,true).tokens==40 && store.best(ids,false).tokens==0,"longest prefix match");
-        check(store.best(root.ids,true).tokens==0,"never the whole prompt");
+        check(store.contains(root.ids,{},true) && !store.contains(root.ids,{},false),"cvec is part of the identity");
+        check(store.best(ids,{},true).tokens==40 && store.best(ids,{},false).tokens==0,"longest prefix match");
+        check(store.best(root.ids,{},true).tokens==0,"never the whole prompt");
         fill(177);
-        check(store.restore(store.best(ids,true).key,ss,g,draft.state,source,err)==ConversationRestore::restored &&
+        check(store.restore(store.best(ids,{},true).key,ss,g,draft.state,source,err)==ConversationRestore::restored &&
               source=="disk","no RAM budget: streamed from the file");
         check(restored(ref),"streamed restore is exact");
     }
@@ -182,7 +182,7 @@ void prefix_session(int fmt, int mode, const std::string& dir) {
     {
         PrefixStore store;
         check(store.open(o,log,err) && store.size()==1,"the index survives a restart");
-        const auto key=store.best(ids,true).key;
+        const auto key=store.best(ids,{},true).key;
         fill(91);
         check(store.restore(key,ss,g,draft.state,source,err)==ConversationRestore::restored && source=="disk>ram",
               "read into the RAM tier");
@@ -200,9 +200,9 @@ void prefix_session(int fmt, int mode, const std::string& dir) {
         PrefixStore small;
         check(small.open(one,log,err) && small.size()==1,"reopen with a small budget");
         check(small.capture(root2,true,ss,g,draft.state,log,err) && small.size()==1 &&
-              small.best(ids,true).tokens==20,"the older prefix leaves for the newer");
+              small.best(ids,{},true).tokens==20,"the older prefix leaves for the newer");
         fill(93);
-        check(small.restore(small.best(ids,true).key,ss,g,draft.state,source,err)==ConversationRestore::restored &&
+        check(small.restore(small.best(ids,{},true).key,ss,g,draft.state,source,err)==ConversationRestore::restored &&
               restored(ref2),"the newer prefix restores");
     }
     {

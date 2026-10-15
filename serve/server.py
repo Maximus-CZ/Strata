@@ -1284,10 +1284,36 @@ class Vision:
         self.vram_mib = int(cfg.get("vram_mib") or 2048)
         self.before_start = None                        # set by the Service: engine.vram(reserve)
         self.after_stop = None                          # set by the Service: engine.vram(None)
+        # stays up while pictures keep coming: stopped only after idle_s s without one (each start costs ~5 s), by a
+        # watcher that takes the Service's FIFO (set_fifo) so the engine regrows only between requests
+        self.idle_s = float(cfg.get("idle_s", 60))
+        self.last_used = 0.0
+        self.fifo = None
         self.proc = None
         self.stopped = True
         if not self.lazy:
             self._start()
+
+    def set_fifo(self, fifo):
+        """local patch: the Service's request FIFO; starts the watcher that stops an idle lazy encoder."""
+        self.fifo = fifo
+        if self.lazy and self.idle_s > 0:
+            threading.Thread(target=self._idle_watch, name="vision-idle", daemon=True).start()
+
+    def _idle_watch(self):
+        while True:
+            time.sleep(5)
+            if not self.alive() or time.time() - self.last_used < self.idle_s:
+                continue
+            if not self.fifo.acquire(blocking=False):   # a request is running: try again later
+                continue
+            try:
+                if self.alive() and time.time() - self.last_used >= self.idle_s:
+                    self.release()
+            except Exception as e:  # noqa: BLE001 -- the watcher must not die
+                print(f"[strata] vision encoder: stopping it failed: {e}", flush=True)
+            finally:
+                self.fifo.release()
 
     def _start(self):
         args, log, env = self.spawn
@@ -1706,6 +1732,8 @@ class Service:
         self.shared = {}                              # the web app's Chat settings for every client (POST /settings)
         self.shared_path = None                       # where they are kept between starts (next to the config)
         self.fifo = threading.Lock()
+        if vision is not None and getattr(vision, "lazy", False) and hasattr(vision, "set_fifo"):
+            vision.set_fifo(self.fifo)                # local patch: the idle watcher stops it between requests only
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
         # #458 (opt-in, the config's "effort_position": "end"): a non-default reasoning effort goes in a short system
@@ -2211,9 +2239,11 @@ class Service:
             with self.fifo:
                 try:
                     encoded = [self.vision.encode(src) for src in images]
-                finally:                                # local patch: a lazy encoder gives its VRAM back now
-                    if getattr(self.vision, "lazy", False):
-                        self.vision.release()
+                finally:                                # local patch: a lazy encoder stays up idle_s s for more
+                    if getattr(self.vision, "lazy", False):    # pictures (the idle watcher stops it); 0 = stop now
+                        self.vision.last_used = time.time()
+                        if getattr(self.vision, "idle_s", 0) <= 0 or getattr(self.vision, "fifo", None) is None:
+                            self.vision.release()
             # one <|image_pad|> per image -> one per image token.  Only the markers the template writes for an image
             # (right after <|vision_start|>) are images: the same text inside a message (an agent reading these docs,
             # #150) is kept as plain text, or it took an image's place and the counts no longer matched.

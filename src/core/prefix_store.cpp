@@ -19,12 +19,15 @@ namespace fs = std::filesystem;
 using Clock = std::chrono::steady_clock;
 
 // file: magic, identity, cvec, ids | running state and K/V headers | K/V payloads (conversation_kv_layout order)
-constexpr char kMagic[8] = {'S', 'T', 'R', 'P', 'F', 'X', '0', '1'};
+constexpr char kMagic[8] = {'S', 'T', 'R', 'P', 'F', 'X', '0', '2'};   // 02: + picture keys
 
-uint64_t key_of(const std::vector<int32_t>& ids, bool cvec) {
+uint64_t key_of(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& imgs, bool cvec) {
     uint64_t h = 1469598103934665603ull ^ (cvec ? 1 : 0);
     for (int32_t id : ids)
         for (int b = 0; b < 4; ++b) { h ^= (uint8_t) ((uint32_t) id >> (8 * b)); h *= 1099511628211ull; }
+    for (const auto& k : imgs)   // local patch: each picture's place and content hash
+        for (uint64_t v : {(uint64_t) k.start, k.hash})
+            for (int b = 0; b < 8; ++b) { h ^= (uint8_t) (v >> (8 * b)); h *= 1099511628211ull; }
     return h;
 }
 
@@ -72,20 +75,27 @@ struct File {
     }
 };
 
-bool put_head(File& w, const std::string& identity, const std::vector<int32_t>& ids, bool cvec) {
+bool put_head(File& w, const std::string& identity, const std::vector<int32_t>& ids,
+              const std::vector<ConversationImageKey>& imgs, bool cvec) {
     return w.put(kMagic, sizeof kMagic) && w.put_pod<uint64_t>(identity.size()) &&
-           w.put(identity.data(), identity.size()) && w.put_pod<uint8_t>(cvec ? 1 : 0) && w.put_vec(ids);
+           w.put(identity.data(), identity.size()) && w.put_pod<uint8_t>(cvec ? 1 : 0) && w.put_vec(ids) &&
+           w.put_vec(imgs);
 }
 
-bool get_head(File& r, const std::string& identity, std::vector<int32_t>& ids, bool& cvec) {
+bool get_head(File& r, const std::string& identity, std::vector<int32_t>& ids,
+              std::vector<ConversationImageKey>& imgs, bool& cvec) {
     char magic[sizeof kMagic];
     uint64_t n = 0;
     uint8_t c = 0;
     if (!r.get(magic, sizeof magic) || !std::equal(magic, magic + sizeof magic, kMagic) || !r.get_pod(n) ||
         n != identity.size()) return false;
     std::string id(identity.size(), '\0');
-    if (!r.get(id.data(), id.size()) || id != identity || !r.get_pod(c) || c > 1 || !r.get_vec(ids) || ids.empty())
+    if (!r.get(id.data(), id.size()) || id != identity || !r.get_pod(c) || c > 1 || !r.get_vec(ids) || ids.empty() ||
+        !r.get_vec(imgs))
         return false;
+    for (size_t i = 0; i < imgs.size(); ++i)   // in order, inside the snapshot
+        if (imgs[i].start < 0 || (size_t) imgs[i].start >= ids.size() || (i && imgs[i].start <= imgs[i - 1].start))
+            return false;
     cvec = c != 0;
     return true;
 }
@@ -199,9 +209,9 @@ bool PrefixStore::open(const Options& options, std::string& log, std::string& er
             File r(p.string(), "rb");
             SavedConversation m;
             std::vector<ConversationKvSizes> sizes;
-            ok = r.f && get_head(r, o_.identity, e.ids, e.cvec) && get_meta(r, m, sizes, true);
+            ok = r.f && get_head(r, o_.identity, e.ids, e.imgs, e.cvec) && get_meta(r, m, sizes, true);
         }
-        e.key = key_of(e.ids, e.cvec);
+        e.key = key_of(e.ids, e.imgs, e.cvec);
         if (!ok || p.filename().string() != fs::path(path(e.key)).filename().string()) {
             fs::remove(p, ec);
             ++dropped;
@@ -223,14 +233,26 @@ bool PrefixStore::open(const Options& options, std::string& log, std::string& er
     return true;
 }
 
-bool PrefixStore::contains(const std::vector<int32_t>& ids, bool cvec) const {
-    for (const auto& e : entries_) if (e.cvec == cvec && e.ids == ids) return true;
+bool PrefixStore::contains(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& imgs,
+                           bool cvec) const {
+    for (const auto& e : entries_) if (e.cvec == cvec && e.ids == ids && e.imgs == imgs) return true;
     return false;
+}
+
+size_t PrefixStore::drop_superseded(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& imgs,
+                                   size_t above, bool cvec) {
+    std::vector<uint64_t> gone;
+    for (const auto& e : entries_)
+        if (e.cvec == cvec && e.ids.size() > above && e.ids.size() < ids.size() &&
+            std::equal(e.ids.begin(), e.ids.end(), ids.begin()) && imgs_below(imgs, e.ids.size()) == e.imgs)
+            gone.push_back(e.key);
+    for (const uint64_t k : gone) erase(k);
+    return gone.size();
 }
 
 bool PrefixStore::capture(const ConversationCheckpoint& root, bool cvec, const SessionState& ss,
                           const ModelGeometry& g, const QsaState& draft, std::string& log, std::string& error) {
-    if (!enabled() || contains(root.ids, cvec)) return true;
+    if (!enabled() || contains(root.ids, root.imgs, cvec)) return true;
     const auto t0 = Clock::now();
     SavedConversation meta;
     std::vector<ConversationKvSizes> sizes;
@@ -241,7 +263,7 @@ bool PrefixStore::capture(const ConversationCheckpoint& root, bool cvec, const S
         log = "skipped: larger than the disk budget";
         return true;
     }
-    const uint64_t key = key_of(root.ids, cvec);
+    const uint64_t key = key_of(root.ids, root.imgs, cvec);
     if (find(key)) erase(key);   // a hash collision: the newer prefix replaces it
     trim_disk(bytes);
     const std::string final_path = path(key), tmp = final_path + ".tmp";
@@ -250,7 +272,7 @@ bool PrefixStore::capture(const ConversationCheckpoint& root, bool cvec, const S
     try {
         std::vector<uint8_t> bounce(o_.bounce);
         File w(tmp, "wb");
-        ok = w.f && put_head(w, o_.identity, root.ids, cvec) && put_meta(w, meta, sizes) &&
+        ok = w.f && put_head(w, o_.identity, root.ids, root.imgs, cvec) && put_meta(w, meta, sizes) &&
              conversation_prefix_save_stream(ss, g, draft, (int64_t) root.ids.size(), bounce,
                                              [&](const uint8_t* p, size_t n) { return w.put(p, n); }, error) &&
              w.close();
@@ -267,6 +289,7 @@ bool PrefixStore::capture(const ConversationCheckpoint& root, bool cvec, const S
     Entry e;
     e.key = key;
     e.ids = root.ids;
+    e.imgs = root.imgs;
     e.cvec = cvec;
     e.file_bytes = (size_t) fs::file_size(final_path, ec);
     e.used = ++clock_;
@@ -302,8 +325,8 @@ ConversationRestore PrefixStore::restore(uint64_t key, SessionState& ss, const M
     SavedConversation m;
     std::vector<ConversationKvSizes> sizes;
     bool cvec = true;
-    if (!r.f || !get_head(r, o_.identity, m.live.ids, cvec) || !get_meta(r, m, sizes) || m.live.ids != e->ids ||
-        cvec != e->cvec) {
+    if (!r.f || !get_head(r, o_.identity, m.live.ids, m.live.imgs, cvec) || !get_meta(r, m, sizes) ||
+        m.live.ids != e->ids || m.live.imgs != e->imgs || cvec != e->cvec) {
         error = "prefix cache: unreadable snapshot file";
         drop();
         return ConversationRestore::invalid;

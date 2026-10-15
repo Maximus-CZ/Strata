@@ -307,8 +307,10 @@ ConversationRestore conversation_snapshot_restore(const SavedConversation& image
 bool conversation_prefix_header(SavedConversation& meta, std::vector<ConversationKvSizes>& sizes,
                                 const ConversationCheckpoint& root, bool cvec, const SessionState& ss,
                                 const ModelGeometry& g, const QsaState& draft, std::string& error) {
-    if (!root.imgs.empty() || !root.stage_parts.empty())
-        return fail(error, "a prefix holds no pictures or stage parts");
+    // local patch: a prefix may hold pictures - they are keyed (start + content hash) in the prefix file and matched
+    // on lookup; their K/V is ordinary K/V and the positions are rebuilt from the prompt on every request
+    if (!root.stage_parts.empty())
+        return fail(error, "a prefix holds no stage parts");
     if (!conversation_checkpoint_validate(root, ss, g, error)) return false;
     SavedConversation m;
     m.geometry = geometry_key(g);
@@ -345,7 +347,7 @@ ConversationRestore conversation_prefix_restore_stream(const SavedConversation& 
                                                        const QsaState& draft, std::vector<uint8_t>& bounce,
                                                        const ConversationRead& read, std::string& error) {
     auto invalid = [&](const char* message) { fail(error, message); return ConversationRestore::invalid; };
-    if (!meta.live.stage_parts.empty() || !meta.live.imgs.empty() || !meta.checkpoints.empty() ||
+    if (!meta.live.stage_parts.empty() || !meta.checkpoints.empty() ||   // pictures allowed
         !meta.stage_images.empty()) return invalid("not a prefix image");
     if (meta.geometry != geometry_key(g)) return invalid("incompatible runtime geometry");
     if (meta.layer_lo != ss.layer_lo || meta.layer_hi != ss.layer_hi)

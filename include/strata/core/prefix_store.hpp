@@ -30,16 +30,30 @@ public:
     // Scans the directory: files of another identity, unreadable or partial ones are deleted.
     bool open(const Options& options, std::string& log, std::string& error);
     bool enabled() const { return !o_.dir.empty(); }
-    // the longest prefix of `prompt` (shorter than it: its last token is always read)
-    template<class Token> Match best(const std::vector<Token>& prompt, bool cvec) const {
+    // the pictures of `imgs` that start below `len` tokens: what a snapshot of `len` tokens must have recorded
+    static std::vector<ConversationImageKey> imgs_below(const std::vector<ConversationImageKey>& imgs, size_t len) {
+        std::vector<ConversationImageKey> v;
+        for (const auto& k : imgs) if (k.start >= 0 && (size_t) k.start < len) v.push_back(k);
+        return v;
+    }
+    // the longest prefix of `prompt` (shorter than it: its last token is always read).  local patch: pictures count -
+    // a snapshot matches only when every picture in its range is the same picture (content hash) at the same place;
+    // the <|image_pad|> tokens alone are equal for any two pictures of one size.
+    template<class Token> Match best(const std::vector<Token>& prompt, const std::vector<ConversationImageKey>& imgs,
+                                     bool cvec) const {
         Match m;
         for (const auto& e : entries_)
             if (e.cvec == cvec && (int64_t) e.ids.size() > m.tokens && e.ids.size() < prompt.size() &&
-                std::equal(e.ids.begin(), e.ids.end(), prompt.begin()))
+                std::equal(e.ids.begin(), e.ids.end(), prompt.begin()) && imgs_below(imgs, e.ids.size()) == e.imgs)
                 m = {e.key, (int64_t) e.ids.size()};
         return m;
     }
-    bool contains(const std::vector<int32_t>& ids, bool cvec) const;
+    bool contains(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& imgs, bool cvec) const;
+    // local patch (conversation end points on disk): drops the saved snapshots that are a strict prefix of `ids`
+    // (pictures included) and longer than `above` tokens - the older end points of the same conversation; the
+    // system-prompt root (at most `above` tokens) stays.  Returns how many were dropped.
+    size_t drop_superseded(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& imgs, size_t above,
+                           bool cvec);
     // Saves the session's state at `root`, a checkpoint of what the session holds, to a new file.
     bool capture(const ConversationCheckpoint& root, bool cvec, const SessionState& session, const ModelGeometry& g,
                  const QsaState& draft, std::string& log, std::string& error);
@@ -55,6 +69,7 @@ private:
     struct Entry {
         uint64_t key = 0;
         std::vector<int32_t> ids;
+        std::vector<ConversationImageKey> imgs;   // local patch: the pictures in the snapshot (start + content hash)
         bool cvec = true;
         size_t file_bytes = 0;
         std::shared_ptr<SavedConversation> ram;

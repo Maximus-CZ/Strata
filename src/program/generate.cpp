@@ -5218,6 +5218,31 @@ int main(int argc, char** argv) {
         // addresses change: all parked images live in ordinary host vectors.
         auto park_current = [&](size_t held) -> bool {
             if (!conversations.enabled() || !live_ok || live.empty()) return true;
+            // local patch (2026-10-15, conversation end points on disk): the outgoing conversation's end point - its
+            // newest checkpoint - is also saved to the prefix cache before the RAM cache may evict it.  A subagent that
+            // comes back then restores it (system prompt + its whole context) instead of reading its history again,
+            // however many conversations rotate through the 4 RAM slots.  Its older end points go; the system-prompt
+            // root stays.  One GPU; pictures are keyed by content hash in the prefix file.
+            if (prefixes.enabled() && stages.empty() && o.turn_token >= 0 && !checks.empty()) {
+                const ConvCheckpoint& tail = checks.back();
+                const int64_t n_tail = (int64_t) tail.ids.size();
+                int64_t root_at = -1;
+                for (int64_t i = 1; i < n_tail; ++i)
+                    if (tail.ids[(size_t) i] == o.turn_token) { root_at = i; break; }
+                if (root_at > 0 && n_tail - root_at >= 1024 && !prefixes.contains(tail.ids, tail.imgs, cvec_cached)) {
+                    std::string plog, perr;
+                    const auto t0 = Clock::now();
+                    if (prefixes.capture(tail, cvec_cached, ss, g, mtp.kv_state(), plog, perr)) {
+                        const size_t gone = prefixes.drop_superseded(tail.ids, tail.imgs, (size_t) root_at, cvec_cached);
+                        std::fprintf(stderr, "strata serve: prefix cache: conversation end point %lld tokens saved in "
+                                     "%.0f ms (%s); %zu older end point%s dropped\n", (long long) n_tail,
+                                     std::chrono::duration<double, std::milli>(Clock::now() - t0).count(), plog.c_str(),
+                                     gone, gone == 1 ? "" : "s");
+                    } else {
+                        std::fprintf(stderr, "strata serve: prefix cache: end point not saved (%s)\n", perr.c_str());
+                    }
+                }
+            }
             // #342: before make_room evicts oldest-first, the copies of this conversation a turn back go (they hold
             // nothing the outgoing chain does not, apart from the tail this conversation rewrote)
             if (const size_t dropped = conversations.drop_superseded(live, live_imgs, checks, cvec_cached))
@@ -6501,9 +6526,8 @@ int main(int argc, char** argv) {
             // its whole history again on its next turn
             strata::core::PrefixStore::Match prefix;
             if (prefixes.enabled() && o.prompt_cache > 0) {
-                const auto m = prefixes.best(ids, want_cvec);
-                if (m.tokens > std::max(resume, slot_tokens) && m.tokens >= parked.tokens &&
-                    imgs_below(req_imgs, m.tokens).empty())
+                const auto m = prefixes.best(ids, req_imgs, want_cvec);   // pictures matched by content hash
+                if (m.tokens > std::max(resume, slot_tokens) && m.tokens >= parked.tokens)
                     prefix = m;
             }
             std::optional<strata::core::SavedConversation> incoming;
@@ -6643,10 +6667,11 @@ int main(int argc, char** argv) {
                 conversations.limit_reuse(0);   // retained K/V pages no longer match the cells
                 ConvCheckpoint root;
                 root.ids.assign(ids.begin(), ids.begin() + prefix.tokens);
+                root.imgs = imgs_below(req_imgs, prefix.tokens);   // local patch: the snapshot's pictures
                 if (r == strata::core::ConversationRestore::restored && checkpoint_save(root, ss, g)) {
                     root.used = ++check_clock;
                     live = root.ids;
-                    live_imgs.clear();
+                    live_imgs = root.imgs;
                     checks.clear();
                     checks.push_back(std::move(root));   // the chain's root again, as if this chat had read it
                     cvec_cached = want_cvec;
@@ -7436,9 +7461,9 @@ int main(int argc, char** argv) {
                 int64_t root_at = -1;
                 for (size_t i = 1; i < live.size(); ++i)
                     if (live[i] == o.turn_token) { root_at = (int64_t) i; break; }
-                if (root_at >= o.prompt_cache_root && imgs_below(live_imgs, root_at).empty())
+                if (root_at >= o.prompt_cache_root)   // pictures allowed: keyed in the file
                     for (const ConvCheckpoint& c : checks)
-                        if ((int64_t) c.ids.size() == root_at && !prefixes.contains(c.ids, cvec_cached)) {
+                        if ((int64_t) c.ids.size() == root_at && !prefixes.contains(c.ids, c.imgs, cvec_cached)) {
                             std::string log;
                             if (prefixes.capture(c, cvec_cached, ss, g, mtp.kv_state(), log, err))
                                 std::fprintf(stderr, "strata serve: prefix cache: %s\n", log.c_str());
