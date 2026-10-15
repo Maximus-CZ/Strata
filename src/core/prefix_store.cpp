@@ -393,7 +393,7 @@ bool PrefixStore::capture(const ConversationCheckpoint& root, bool cvec, const S
     int64_t shared = 0;
     std::vector<ConversationKvSizes> from(sizes.size(), ConversationKvSizes{});
     {
-        const Entry* base = nullptr;
+        std::vector<std::pair<int64_t, const Entry*>> bases;   // the most shared tokens first
         for (const auto& e : entries_) {
             if (e.cvec != cvec || e.shape != shape || e.sizes.size() != sizes.size() || depth(e.key) >= kMaxDepth)
                 continue;
@@ -406,52 +406,59 @@ bool PrefixStore::capture(const ConversationCheckpoint& root, bool cvec, const S
                     c = std::min<int64_t>(c, std::min(i < a.size() ? a[i].start : c, i < b.size() ? b[i].start : c));
                     break;
                 }
-            if (c > shared) { shared = c; base = &e; }
+            if (c > 0) bases.push_back({c, &e});
         }
-        std::vector<ConversationKvSizes> f;
-        conversation_prefix_unchanged(meta, sizes, shared - 1, f);
-        size_t kept = 0;
-        bool ok = base != nullptr;
-        for (size_t j = 0; ok && j < sizes.size(); ++j)
-            for (size_t i = 0; i < 5; ++i) {
-                ok = ok && f[j][i] <= base->sizes[j][i];
-                kept += f[j][i];
-            }
-        ok = ok && kept * 2 >= payload;   // worth a dependency only when it saves at least half
-        if (ok) {   // sampled comparison: the start, the end and evenly between, of every payload
-            std::vector<uint8_t> mine(kSample), theirs(kSample);
-            std::vector<std::unique_ptr<File>> files;
-            std::vector<uint64_t> keys;
-            auto file_of = [&](uint64_t k) -> std::FILE* {
-                for (size_t x = 0; x < keys.size(); ++x) if (keys[x] == k) return files[x]->f;
-                files.push_back(std::make_unique<File>(path(k), "rb"));
-                keys.push_back(k);
-                return files.back()->f;
-            };
+        std::stable_sort(bases.begin(), bases.end(), [](const auto& x, const auto& y) { return x.first > y.first; });
+        // the closest one may hold the last shared cells computed in another session (sampled bytes differ): the
+        // next closest - usually the system-prompt root this session was restored from - is tried then
+        for (size_t tried = 0; tried < bases.size() && tried < 3 && !parent; ++tried) {
+            const Entry* base = bases[tried].second;
+            shared = bases[tried].first;
+            std::vector<ConversationKvSizes> f;
+            conversation_prefix_unchanged(meta, sizes, shared - 1, f);
+            size_t kept = 0;
+            bool ok = base != nullptr;
             for (size_t j = 0; ok && j < sizes.size(); ++j)
-                for (size_t i = 0; ok && i < 5; ++i) {
-                    const size_t len = f[j][i];
-                    if (!len) continue;
-                    for (size_t k = 0; ok && k <= kSamples; ++k) {
-                        const size_t n = std::min(kSample, len);
-                        const size_t at = k == kSamples ? len - n : (len - n) / kSamples * k;
-                        std::vector<Span> sp;
-                        ok = spans(*base, j, i, at, n, sp) &&
-                             conversation_prefix_read(ss, g, draft, upto, j, i, at, n, mine.data(), error);
-                        size_t got = 0;
-                        for (const auto& x : sp) {   // spans come tail first
-                            if (!ok) break;
-                            std::FILE* r = file_of(x.e->key);
-                            ok = r && seek_to(r, payload_at(*x.e, j, i) + (x.at - x.e->from[j][i])) == 0 &&
-                                 std::fread(theirs.data() + (x.at - at), 1, x.n, r) == x.n;
-                            got += x.n;
-                        }
-                        ok = ok && got == n && std::equal(mine.begin(), mine.begin() + (ptrdiff_t) n, theirs.begin());
-                    }
+                for (size_t i = 0; i < 5; ++i) {
+                    ok = ok && f[j][i] <= base->sizes[j][i];
+                    kept += f[j][i];
                 }
-            error.clear();
+            ok = ok && kept * 2 >= payload;   // worth a dependency only when it saves at least half
+            if (ok) {   // sampled comparison: the start, the end and evenly between, of every payload
+                std::vector<uint8_t> mine(kSample), theirs(kSample);
+                std::vector<std::unique_ptr<File>> files;
+                std::vector<uint64_t> keys;
+                auto file_of = [&](uint64_t k) -> std::FILE* {
+                    for (size_t x = 0; x < keys.size(); ++x) if (keys[x] == k) return files[x]->f;
+                    files.push_back(std::make_unique<File>(path(k), "rb"));
+                    keys.push_back(k);
+                    return files.back()->f;
+                };
+                for (size_t j = 0; ok && j < sizes.size(); ++j)
+                    for (size_t i = 0; ok && i < 5; ++i) {
+                        const size_t len = f[j][i];
+                        if (!len) continue;
+                        for (size_t k = 0; ok && k <= kSamples; ++k) {
+                            const size_t n = std::min(kSample, len);
+                            const size_t at = k == kSamples ? len - n : (len - n) / kSamples * k;
+                            std::vector<Span> sp;
+                            ok = spans(*base, j, i, at, n, sp) &&
+                                 conversation_prefix_read(ss, g, draft, upto, j, i, at, n, mine.data(), error);
+                            size_t got = 0;
+                            for (const auto& x : sp) {   // spans come tail first
+                                if (!ok) break;
+                                std::FILE* r = file_of(x.e->key);
+                                ok = r && seek_to(r, payload_at(*x.e, j, i) + (x.at - x.e->from[j][i])) == 0 &&
+                                     std::fread(theirs.data() + (x.at - at), 1, x.n, r) == x.n;
+                                got += x.n;
+                            }
+                            ok = ok && got == n && std::equal(mine.begin(), mine.begin() + (ptrdiff_t) n, theirs.begin());
+                        }
+                    }
+                error.clear();
+            }
+            if (ok) { parent = base->key; from = std::move(f); touch(parent); }
         }
-        if (ok) { parent = base->key; from = std::move(f); touch(parent); }
     }
     size_t bytes = whole;
     for (const auto& z : from) for (size_t n : z) bytes -= n;
