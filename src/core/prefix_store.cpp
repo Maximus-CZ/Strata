@@ -18,8 +18,43 @@ namespace {
 namespace fs = std::filesystem;
 using Clock = std::chrono::steady_clock;
 
-// file: magic, identity, cvec, ids | running state and K/V headers | K/V payloads (conversation_kv_layout order)
-constexpr char kMagic[8] = {'S', 'T', 'R', 'P', 'F', 'X', '0', '2'};   // 02: + picture keys
+// file: magic, identity, cvec, ids, pictures, parent | running state and K/V headers with each payload's delta start
+// | K/V payloads past their delta starts (conversation_kv_layout order)
+constexpr char kMagic[8] = {'S', 'T', 'R', 'P', 'F', 'X', '0', '3'};   // 02: + picture keys, 03: + deltas 
+constexpr size_t kMaxDepth = 24;        // a longer chain is saved whole again
+constexpr size_t kSample = 4096;        // bytes per sampled comparison with the base
+constexpr size_t kSamples = 8;          // sampled places per payload
+
+int64_t seek_to(std::FILE* f, uint64_t at) {
+#ifdef _WIN32
+    return _fseeki64(f, (long long) at, SEEK_SET);
+#else
+    return fseeko(f, (off_t) at, SEEK_SET);
+#endif
+}
+
+uint64_t tell(std::FILE* f) {
+#ifdef _WIN32
+    return (uint64_t) _ftelli64(f);
+#else
+    return (uint64_t) ftello(f);
+#endif
+}
+
+uint64_t mix(uint64_t h, uint64_t v) {
+    for (int b = 0; b < 8; ++b) { h ^= (uint8_t) (v >> (8 * b)); h *= 1099511628211ull; }
+    return h;
+}
+
+// what must agree between a delta and its base: geometry, layer range and every layer's K/V format
+uint64_t shape_of(const SavedConversation& m) {
+    uint64_t h = 1469598103934665603ull;
+    for (int64_t v : m.geometry) h = mix(h, (uint64_t) v);
+    h = mix(mix(h, (uint64_t) m.layer_lo), (uint64_t) m.layer_hi);
+    for (const auto& k : m.kv)
+        for (int64_t v : {(int64_t) k.format, k.heads, k.head_dim, k.page_size, k.idx_dim}) h = mix(h, (uint64_t) v);
+    return mix(h, m.kv.size());
+}
 
 uint64_t key_of(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& imgs, bool cvec) {
     uint64_t h = 1469598103934665603ull ^ (cvec ? 1 : 0);
@@ -58,7 +93,7 @@ struct File {
     }
     template<class T> bool skip_vec() {   // the index needs no running state
         uint64_t n = 0;
-        if (!get_pod(n) || n > left / sizeof(T) || std::fseek(f, (long) (n * sizeof(T)), SEEK_CUR) != 0) return false;
+        if (!get_pod(n) || n > left / sizeof(T) || seek_to(f, tell(f) + n * sizeof(T)) != 0) return false;
         left -= n * sizeof(T);
         return true;
     }
@@ -76,14 +111,14 @@ struct File {
 };
 
 bool put_head(File& w, const std::string& identity, const std::vector<int32_t>& ids,
-              const std::vector<ConversationImageKey>& imgs, bool cvec) {
+              const std::vector<ConversationImageKey>& imgs, bool cvec, uint64_t parent) {
     return w.put(kMagic, sizeof kMagic) && w.put_pod<uint64_t>(identity.size()) &&
            w.put(identity.data(), identity.size()) && w.put_pod<uint8_t>(cvec ? 1 : 0) && w.put_vec(ids) &&
-           w.put_vec(imgs);
+           w.put_vec(imgs) && w.put_pod(parent);
 }
 
 bool get_head(File& r, const std::string& identity, std::vector<int32_t>& ids,
-              std::vector<ConversationImageKey>& imgs, bool& cvec) {
+              std::vector<ConversationImageKey>& imgs, bool& cvec, uint64_t& parent) {
     char magic[sizeof kMagic];
     uint64_t n = 0;
     uint8_t c = 0;
@@ -91,7 +126,7 @@ bool get_head(File& r, const std::string& identity, std::vector<int32_t>& ids,
         n != identity.size()) return false;
     std::string id(identity.size(), '\0');
     if (!r.get(id.data(), id.size()) || id != identity || !r.get_pod(c) || c > 1 || !r.get_vec(ids) || ids.empty() ||
-        !r.get_vec(imgs))
+        !r.get_vec(imgs) || !r.get_pod(parent))
         return false;
     for (size_t i = 0; i < imgs.size(); ++i)   // in order, inside the snapshot
         if (imgs[i].start < 0 || (size_t) imgs[i].start >= ids.size() || (i && imgs[i].start <= imgs[i - 1].start))
@@ -100,7 +135,8 @@ bool get_head(File& r, const std::string& identity, std::vector<int32_t>& ids,
     return true;
 }
 
-bool put_meta(File& w, const SavedConversation& m, const std::vector<ConversationKvSizes>& sizes) {
+bool put_meta(File& w, const SavedConversation& m, const std::vector<ConversationKvSizes>& sizes,
+              const std::vector<ConversationKvSizes>& from) {
     bool ok = w.put(m.geometry.data(), sizeof m.geometry) && w.put_pod(m.layer_lo) && w.put_pod(m.layer_hi);
     for (const auto* v : {&m.live.gdn, &m.live.ple, &m.live.tails, &m.live.dead, &m.live.block_pos})
         ok = ok && w.put_vec(*v);
@@ -109,12 +145,13 @@ bool put_meta(File& w, const SavedConversation& m, const std::vector<Conversatio
         const auto& k = m.kv[i];
         ok = w.put_pod<int32_t>(k.format) && w.put_pod(k.cells) && w.put_pod(k.heads) && w.put_pod(k.head_dim) &&
              w.put_pod(k.page_size) && w.put_pod(k.pooled_rows) && w.put_pod(k.idx_dim) &&
-             w.put(sizes[i].data(), sizeof sizes[i]);
+             w.put(sizes[i].data(), sizeof sizes[i]) && w.put(from[i].data(), sizeof from[i]);
     }
     return ok;
 }
 
-bool get_meta(File& r, SavedConversation& m, std::vector<ConversationKvSizes>& sizes, bool skip_state = false) {
+bool get_meta(File& r, SavedConversation& m, std::vector<ConversationKvSizes>& sizes,
+              std::vector<ConversationKvSizes>& from, bool skip_state = false) {
     bool ok = r.get(m.geometry.data(), sizeof m.geometry) && r.get_pod(m.layer_lo) && r.get_pod(m.layer_hi);
     for (auto* v : {&m.live.gdn, &m.live.ple, &m.live.tails, &m.live.dead, &m.live.block_pos})
         ok = ok && (skip_state ? r.skip_vec<uint8_t>() : r.get_vec(*v));
@@ -122,15 +159,19 @@ bool get_meta(File& r, SavedConversation& m, std::vector<ConversationKvSizes>& s
     if (!ok || !r.get_pod(layers) || layers > 4096) return false;
     m.kv.resize((size_t) layers);
     sizes.resize((size_t) layers);
+    from.resize((size_t) layers);
     uint64_t payload = 0;
     for (size_t i = 0; i < m.kv.size(); ++i) {
         auto& k = m.kv[i];
         int32_t format = 0;
         if (!r.get_pod(format) || !r.get_pod(k.cells) || !r.get_pod(k.heads) || !r.get_pod(k.head_dim) ||
             !r.get_pod(k.page_size) || !r.get_pod(k.pooled_rows) || !r.get_pod(k.idx_dim) ||
-            !r.get(sizes[i].data(), sizeof sizes[i])) return false;
+            !r.get(sizes[i].data(), sizeof sizes[i]) || !r.get(from[i].data(), sizeof from[i])) return false;
         k.format = format;
-        for (size_t n : sizes[i]) payload += n;
+        for (size_t a = 0; a < 5; ++a) {
+            if (from[i][a] > sizes[i][a]) return false;
+            payload += sizes[i][a] - from[i][a];
+        }
     }
     return payload == r.left;   // the payloads, exactly: a partial file restores nothing
 }
@@ -147,11 +188,66 @@ PrefixStore::Entry* PrefixStore::find(uint64_t key) {
     return nullptr;
 }
 
+const PrefixStore::Entry* PrefixStore::find(uint64_t key) const {
+    for (const auto& e : entries_) if (e.key == key) return &e;
+    return nullptr;
+}
+
+// the entry and every snapshot stored on it (a delta without its base is nothing)
 void PrefixStore::erase(uint64_t key) {
     std::error_code ec;
     fs::remove(path(key), ec);
     entries_.erase(std::remove_if(entries_.begin(), entries_.end(), [&](const Entry& e) { return e.key == key; }),
                    entries_.end());
+    for (;;) {
+        const auto child = std::find_if(entries_.begin(), entries_.end(),
+                                        [&](const Entry& e) { return e.parent == key; });
+        if (child == entries_.end()) break;
+        erase(child->key);
+    }
+}
+
+void PrefixStore::touch(uint64_t key) {
+    const uint64_t now = ++clock_;
+    std::error_code ec;
+    for (size_t hop = 0; key && hop <= kMaxDepth + 1; ++hop) {
+        Entry* e = find(key);
+        if (!e) break;
+        e->used = now;
+        fs::last_write_time(path(key), fs::file_time_type::clock::now(), ec);   // the LRU order across restarts
+        key = e->parent;
+    }
+}
+
+size_t PrefixStore::depth(uint64_t key) const {
+    size_t d = 0;
+    for (const Entry* e = find(key); e && e->parent && d <= kMaxDepth + 1; e = find(e->parent)) ++d;
+    return d;
+}
+
+uint64_t PrefixStore::payload_at(const Entry& e, size_t j, size_t i) const {
+    uint64_t at = e.data_at;
+    for (size_t a = 0; a < e.sizes.size(); ++a)
+        for (size_t b = 0; b < 5; ++b) {
+            if (a == j && b == i) return at;
+            at += e.sizes[a][b] - e.from[a][b];
+        }
+    return at;
+}
+
+bool PrefixStore::spans(const Entry& e, size_t j, size_t i, size_t at, size_t n, std::vector<Span>& out) const {
+    const Entry* cur = &e;
+    for (size_t hop = 0; n; ++hop) {
+        if (!cur || hop > kMaxDepth + 1 || j >= cur->sizes.size() || at + n > cur->sizes[j][i]) return false;
+        const size_t own = cur->from[j][i];
+        if (at + n > own) {   // the tail of the range is this entry's
+            const size_t from = std::max(at, own);
+            out.push_back({cur, from, at + n - from});
+            n = from - at;
+        }
+        if (n) cur = cur->parent ? find(cur->parent) : nullptr;
+    }
+    return true;
 }
 
 size_t PrefixStore::ram_bytes() const {
@@ -208,8 +304,9 @@ bool PrefixStore::open(const Options& options, std::string& log, std::string& er
         {
             File r(p.string(), "rb");
             SavedConversation m;
-            std::vector<ConversationKvSizes> sizes;
-            ok = r.f && get_head(r, o_.identity, e.ids, e.imgs, e.cvec) && get_meta(r, m, sizes, true);
+            ok = r.f && get_head(r, o_.identity, e.ids, e.imgs, e.cvec, e.parent) &&
+                 get_meta(r, m, e.sizes, e.from, true);
+            if (ok) { e.data_at = tell(r.f); e.shape = shape_of(m); }
         }
         e.key = key_of(e.ids, e.imgs, e.cvec);
         if (!ok || p.filename().string() != fs::path(path(e.key)).filename().string()) {
@@ -224,6 +321,19 @@ bool PrefixStore::open(const Options& options, std::string& log, std::string& er
     for (auto& f : found) {
         f.e.used = ++clock_;
         entries_.push_back(std::move(f.e));
+    }
+    // a delta whose base is gone, of another shape or too short for it, or a chain too long (a loop) is dropped
+    for (bool again = true; again;) {
+        again = false;
+        for (const auto& e : entries_) {
+            if (!e.parent) continue;
+            const Entry* b = find(e.parent);
+            bool ok = b && b->cvec == e.cvec && b->shape == e.shape && b->sizes.size() == e.sizes.size() &&
+                      depth(e.key) <= kMaxDepth;
+            for (size_t j = 0; ok && j < e.sizes.size(); ++j)
+                for (size_t i = 0; i < 5; ++i) ok = ok && e.from[j][i] <= b->sizes[j][i];
+            if (!ok) { erase(e.key); ++dropped; again = true; break; }
+        }
     }
     trim_disk(0);
     char text[160];
@@ -241,13 +351,20 @@ bool PrefixStore::contains(const std::vector<int32_t>& ids, const std::vector<Co
 
 size_t PrefixStore::drop_superseded(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& imgs,
                                    size_t above, bool cvec) {
-    std::vector<uint64_t> gone;
-    for (const auto& e : entries_)
-        if (e.cvec == cvec && e.ids.size() > above && e.ids.size() < ids.size() &&
-            std::equal(e.ids.begin(), e.ids.end(), ids.begin()) && imgs_below(imgs, e.ids.size()) == e.imgs)
-            gone.push_back(e.key);
-    for (const uint64_t k : gone) erase(k);
-    return gone.size();
+    size_t gone = 0;
+    for (bool again = true; again;) {   // a base is dropped once nothing is stored on it any more
+        again = false;
+        for (const auto& e : entries_)
+            if (e.cvec == cvec && e.ids.size() > above && e.ids.size() < ids.size() &&
+                std::equal(e.ids.begin(), e.ids.end(), ids.begin()) && imgs_below(imgs, e.ids.size()) == e.imgs &&
+                std::none_of(entries_.begin(), entries_.end(), [&](const Entry& c) { return c.parent == e.key; })) {
+                erase(e.key);
+                ++gone;
+                again = true;
+                break;
+            }
+    }
+    return gone;
 }
 
 bool PrefixStore::capture(const ConversationCheckpoint& root, bool cvec, const SessionState& ss,
@@ -257,24 +374,105 @@ bool PrefixStore::capture(const ConversationCheckpoint& root, bool cvec, const S
     SavedConversation meta;
     std::vector<ConversationKvSizes> sizes;
     if (!conversation_prefix_header(meta, sizes, root, cvec, ss, g, draft, error)) return false;
-    size_t bytes = root.bytes();
-    for (const auto& z : sizes) for (size_t n : z) bytes += n;
-    if (bytes > o_.disk_budget) {
+    size_t payload = 0;
+    for (const auto& z : sizes) for (size_t n : z) payload += n;
+    const size_t whole = root.bytes() + payload;
+    if (whole > o_.disk_budget) {
         log = "skipped: larger than the disk budget";
         return true;
     }
     const uint64_t key = key_of(root.ids, root.imgs, cvec);
     if (find(key)) erase(key);   // a hash collision: the newer prefix replaces it
+    const uint64_t shape = shape_of(meta);
+    const int64_t upto = (int64_t) root.ids.size();
+
+    // local patch (delta end points): the base is the saved snapshot sharing the most tokens (pictures included)
+    // - usually this conversation's previous end point.  Its bytes must be the session's: equal tokens computed in
+    // another session differ in the last bits, so sampled places of every payload are compared first.
+    uint64_t parent = 0;
+    int64_t shared = 0;
+    std::vector<ConversationKvSizes> from(sizes.size(), ConversationKvSizes{});
+    {
+        const Entry* base = nullptr;
+        for (const auto& e : entries_) {
+            if (e.cvec != cvec || e.shape != shape || e.sizes.size() != sizes.size() || depth(e.key) >= kMaxDepth)
+                continue;
+            int64_t c = 0;
+            const size_t lim = std::min(e.ids.size(), root.ids.size());
+            while ((size_t) c < lim && e.ids[(size_t) c] == root.ids[(size_t) c]) ++c;
+            const auto a = imgs_below(root.imgs, (size_t) c), b = imgs_below(e.imgs, (size_t) c);
+            for (size_t i = 0; i < std::max(a.size(), b.size()); ++i)
+                if (i >= a.size() || i >= b.size() || !(a[i] == b[i])) {
+                    c = std::min<int64_t>(c, std::min(i < a.size() ? a[i].start : c, i < b.size() ? b[i].start : c));
+                    break;
+                }
+            if (c > shared) { shared = c; base = &e; }
+        }
+        std::vector<ConversationKvSizes> f;
+        conversation_prefix_unchanged(meta, sizes, shared - 1, f);
+        size_t kept = 0;
+        bool ok = base != nullptr;
+        for (size_t j = 0; ok && j < sizes.size(); ++j)
+            for (size_t i = 0; i < 5; ++i) {
+                ok = ok && f[j][i] <= base->sizes[j][i];
+                kept += f[j][i];
+            }
+        ok = ok && kept * 2 >= payload;   // worth a dependency only when it saves at least half
+        if (ok) {   // sampled comparison: the start, the end and evenly between, of every payload
+            std::vector<uint8_t> mine(kSample), theirs(kSample);
+            std::vector<std::unique_ptr<File>> files;
+            std::vector<uint64_t> keys;
+            auto file_of = [&](uint64_t k) -> std::FILE* {
+                for (size_t x = 0; x < keys.size(); ++x) if (keys[x] == k) return files[x]->f;
+                files.push_back(std::make_unique<File>(path(k), "rb"));
+                keys.push_back(k);
+                return files.back()->f;
+            };
+            for (size_t j = 0; ok && j < sizes.size(); ++j)
+                for (size_t i = 0; ok && i < 5; ++i) {
+                    const size_t len = f[j][i];
+                    if (!len) continue;
+                    for (size_t k = 0; ok && k <= kSamples; ++k) {
+                        const size_t n = std::min(kSample, len);
+                        const size_t at = k == kSamples ? len - n : (len - n) / kSamples * k;
+                        std::vector<Span> sp;
+                        ok = spans(*base, j, i, at, n, sp) &&
+                             conversation_prefix_read(ss, g, draft, upto, j, i, at, n, mine.data(), error);
+                        size_t got = 0;
+                        for (const auto& x : sp) {   // spans come tail first
+                            if (!ok) break;
+                            std::FILE* r = file_of(x.e->key);
+                            ok = r && seek_to(r, payload_at(*x.e, j, i) + (x.at - x.e->from[j][i])) == 0 &&
+                                 std::fread(theirs.data() + (x.at - at), 1, x.n, r) == x.n;
+                            got += x.n;
+                        }
+                        ok = ok && got == n && std::equal(mine.begin(), mine.begin() + (ptrdiff_t) n, theirs.begin());
+                    }
+                }
+            error.clear();
+        }
+        if (ok) { parent = base->key; from = std::move(f); touch(parent); }
+    }
+    size_t bytes = whole;
+    for (const auto& z : from) for (size_t n : z) bytes -= n;
     trim_disk(bytes);
+    if (parent && !find(parent)) {   // the budget took the base: whole after all
+        parent = 0;
+        from.assign(sizes.size(), ConversationKvSizes{});
+        trim_disk(whole);
+    }
     const std::string final_path = path(key), tmp = final_path + ".tmp";
     std::error_code ec;
     bool ok = false;
+    uint64_t data_at = 0;
     try {
         std::vector<uint8_t> bounce(o_.bounce);
         File w(tmp, "wb");
-        ok = w.f && put_head(w, o_.identity, root.ids, root.imgs, cvec) && put_meta(w, meta, sizes) &&
-             conversation_prefix_save_stream(ss, g, draft, (int64_t) root.ids.size(), bounce,
-                                             [&](const uint8_t* p, size_t n) { return w.put(p, n); }, error) &&
+        ok = w.f && put_head(w, o_.identity, root.ids, root.imgs, cvec, parent) && put_meta(w, meta, sizes, from);
+        if (ok) data_at = tell(w.f);
+        ok = ok && conversation_prefix_save_stream_from(ss, g, draft, upto, from, bounce,
+                                                        [&](const uint8_t* p, size_t n) { return w.put(p, n); },
+                                                        error) &&
              w.close();
         if (!ok && error.empty()) error = "prefix cache: writing " + tmp + " failed";
     } catch (const std::bad_alloc&) {
@@ -293,12 +491,25 @@ bool PrefixStore::capture(const ConversationCheckpoint& root, bool cvec, const S
     e.cvec = cvec;
     e.file_bytes = (size_t) fs::file_size(final_path, ec);
     e.used = ++clock_;
+    e.parent = parent;
+    e.shape = shape;
+    e.data_at = data_at;
+    e.sizes = std::move(sizes);
+    e.from = std::move(from);
     entries_.push_back(std::move(e));
-    char text[160];
-    std::snprintf(text, sizeof text, "saved %zu tokens (%.1f MB) in %.1f ms; snapshots=%zu disk=%.1f MB",
-                  root.ids.size(), (double) entries_.back().file_bytes / 1e6,
-                  std::chrono::duration<double, std::milli>(Clock::now() - t0).count(), entries_.size(),
-                  (double) disk_bytes() / 1e6);
+    char text[224];
+    if (parent)
+        std::snprintf(text, sizeof text,
+                      "saved %zu tokens (%.1f MB, a delta on %lld saved tokens, chain of %zu) in %.1f ms; "
+                      "snapshots=%zu disk=%.1f MB",
+                      root.ids.size(), (double) entries_.back().file_bytes / 1e6, (long long) shared,
+                      depth(key) + 1, std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
+                      entries_.size(), (double) disk_bytes() / 1e6);
+    else
+        std::snprintf(text, sizeof text, "saved %zu tokens (%.1f MB) in %.1f ms; snapshots=%zu disk=%.1f MB",
+                      root.ids.size(), (double) entries_.back().file_bytes / 1e6,
+                      std::chrono::duration<double, std::milli>(Clock::now() - t0).count(), entries_.size(),
+                      (double) disk_bytes() / 1e6);
     log = text;
     return true;
 }
@@ -307,9 +518,8 @@ ConversationRestore PrefixStore::restore(uint64_t key, SessionState& ss, const M
                                          const QsaState& draft, std::string& source, std::string& error) {
     Entry* e = find(key);
     if (!e) { error = "prefix cache: no such snapshot"; return ConversationRestore::invalid; }
-    e->used = ++clock_;
-    std::error_code ec;
-    fs::last_write_time(path(key), fs::file_time_type::clock::now(), ec);   // the LRU order across restarts
+    touch(key);
+    if (e->parent) return restore_chain(*e, ss, g, draft, source, error);
     if (e->ram) {
         source = "ram";
         const auto r = conversation_snapshot_restore(*e->ram, ss, g, draft, error);
@@ -323,10 +533,11 @@ ConversationRestore PrefixStore::restore(uint64_t key, SessionState& ss, const M
         erase(key);
     };
     SavedConversation m;
-    std::vector<ConversationKvSizes> sizes;
+    std::vector<ConversationKvSizes> sizes, from;
     bool cvec = true;
-    if (!r.f || !get_head(r, o_.identity, m.live.ids, m.live.imgs, cvec) || !get_meta(r, m, sizes) ||
-        m.live.ids != e->ids || m.live.imgs != e->imgs || cvec != e->cvec) {
+    uint64_t parent = 0;
+    if (!r.f || !get_head(r, o_.identity, m.live.ids, m.live.imgs, cvec, parent) || !get_meta(r, m, sizes, from) ||
+        m.live.ids != e->ids || m.live.imgs != e->imgs || cvec != e->cvec || parent) {
         error = "prefix cache: unreadable snapshot file";
         drop();
         return ConversationRestore::invalid;
@@ -372,6 +583,77 @@ ConversationRestore PrefixStore::restore(uint64_t key, SessionState& ss, const M
     const auto result = conversation_prefix_restore_stream(m, sizes, ss, g, draft, bounce,
                                                            [&](uint8_t* p, size_t n) { return r.get(p, n); }, error);
     if (result == ConversationRestore::invalid) drop();
+    return result;
+}
+
+// local patch (delta end points): the running state from the entry's own file, the K/V payloads from the chain
+ConversationRestore PrefixStore::restore_chain(const Entry& e, SessionState& ss, const ModelGeometry& g,
+                                               const QsaState& draft, std::string& source, std::string& error) {
+    const uint64_t key = e.key;
+    std::vector<std::unique_ptr<File>> files;
+    std::vector<uint64_t> keys;
+    auto file_of = [&](uint64_t k) -> std::FILE* {
+        for (size_t i = 0; i < keys.size(); ++i) if (keys[i] == k) return files[i]->f;
+        files.push_back(std::make_unique<File>(path(k), "rb"));
+        keys.push_back(k);
+        return files.back()->f;
+    };
+    SavedConversation m;
+    std::vector<ConversationKvSizes> sizes, from;
+    bool cvec = true;
+    uint64_t parent = 0;
+    {
+        File& r = *(files.push_back(std::make_unique<File>(path(key), "rb")), keys.push_back(key), files.back());
+        if (!r.f || !get_head(r, o_.identity, m.live.ids, m.live.imgs, cvec, parent) || !get_meta(r, m, sizes, from) ||
+            m.live.ids != e.ids || m.live.imgs != e.imgs || cvec != e.cvec || parent != e.parent ||
+            sizes != e.sizes || from != e.from) {
+            files.clear();
+            error = "prefix cache: unreadable snapshot file";
+            erase(key);
+            return ConversationRestore::invalid;
+        }
+    }
+    m.cvec = cvec;
+    std::vector<ConversationKvPiece> pieces;
+    size_t levels = 0;
+    bool ok = true;
+    std::vector<uint64_t> broken;
+    for (size_t j = 0; ok && j < sizes.size(); ++j)
+        for (size_t i = 0; ok && i < 5; ++i) {
+            std::vector<Span> sp;
+            ok = spans(e, j, i, 0, sizes[j][i], sp);
+            for (const auto& x : sp) {
+                std::FILE* f = file_of(x.e->key);
+                std::error_code ec;
+                if (!f || fs::file_size(path(x.e->key), ec) != x.e->file_bytes) {   // a base cut short or gone
+                    ok = false;
+                    broken.push_back(x.e->key);
+                    break;
+                }
+                uint64_t pos = payload_at(*x.e, j, i) + (x.at - x.e->from[j][i]);
+                pieces.push_back({j, i, x.at, x.n, [f, pos](uint8_t* p, size_t n) mutable {
+                                      const bool good = seek_to(f, pos) == 0 && std::fread(p, 1, n, f) == n;
+                                      pos += n;
+                                      return good;
+                                  }});
+            }
+        }
+    levels = keys.size();
+    if (!ok) {
+        files.clear();
+        error = "prefix cache: a delta's base is unreadable";
+        for (uint64_t k : broken) erase(k);
+        if (find(key)) erase(key);
+        return ConversationRestore::invalid;
+    }
+    std::vector<uint8_t> bounce;
+    try { bounce.resize(o_.bounce); } catch (const std::bad_alloc&) {
+        error = "prefix cache: no memory for the read buffer";
+        return ConversationRestore::invalid;
+    }
+    const auto result = conversation_prefix_restore_pieces(m, sizes, ss, g, draft, bounce, pieces, error);
+    source = "disk, " + std::to_string(levels) + " files";
+    if (result == ConversationRestore::invalid) { files.clear(); erase(key); }
     return result;
 }
 

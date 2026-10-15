@@ -283,6 +283,59 @@ bool conversation_kv_restore_stream(const ConversationKv& header, const Conversa
     return restore_residency(st, g, upto, error);
 }
 
+// local patch (delta end points): the payloads from byte from[i] of each array on
+bool conversation_kv_save_stream_from(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index,
+                                      const ConversationKvSizes& from, std::vector<uint8_t>& bounce,
+                                      const ConversationWrite& write, std::string& error) {
+    ConversationKv header;
+    ConversationKvSizes sizes{};
+    if (!conversation_kv_layout(header, sizes, st, g, upto, index, error) || bounce.empty()) return false;
+    const auto src = pools(st);
+    for (size_t i = 0; i < sizes.size(); ++i) {
+        if (from[i] > sizes[i]) { error = "conversation snapshot: delta start past the payload"; return false; }
+        for (size_t at = from[i]; at < sizes[i];) {
+            const size_t n = std::min(bounce.size(), sizes[i] - at);
+            if (!transfer(bounce.data(), static_cast<const uint8_t*>(src[i]) + at, n, error)) return false;
+            if (!write(bounce.data(), n)) { error = "conversation snapshot: stream write failed"; return false; }
+            at += n;
+        }
+    }
+    return true;
+}
+
+bool conversation_kv_read(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index, size_t array,
+                          size_t at, size_t n, uint8_t* out, std::string& error) {
+    ConversationKv header;
+    ConversationKvSizes sizes{};
+    if (!conversation_kv_layout(header, sizes, st, g, upto, index, error)) return false;
+    if (array >= sizes.size() || at > sizes[array] || n > sizes[array] - at) {
+        error = "conversation snapshot: read past the payload";
+        return false;
+    }
+    return transfer(out, static_cast<const uint8_t*>(pools(st)[array]) + at, n, error);
+}
+
+bool conversation_kv_restore_pieces(const ConversationKv& header, const ConversationKvSizes& sizes,
+                                    const QsaState& st, const ModelGeometry& g, int64_t upto, bool index,
+                                    std::vector<uint8_t>& bounce, const std::vector<const ConversationKvPiece*>& pieces,
+                                    std::string& error) {
+    if (!conversation_kv_validate_sizes(header, sizes, st, g, upto, index, error) || bounce.empty()) return false;
+    const auto dst = pools(st);
+    for (const ConversationKvPiece* p : pieces) {
+        if (p->array >= sizes.size() || p->at > sizes[p->array] || p->n > sizes[p->array] - p->at) {
+            error = "conversation snapshot: piece past the payload";
+            return false;
+        }
+        for (size_t done = 0; done < p->n;) {
+            const size_t n = std::min(bounce.size(), p->n - done);
+            if (!p->read(bounce.data(), n)) { error = "conversation snapshot: stream read failed"; return false; }
+            if (!transfer(static_cast<uint8_t*>(dst[p->array]) + p->at + done, bounce.data(), n, error)) return false;
+            done += n;
+        }
+    }
+    return restore_residency(st, g, upto, error);
+}
+
 bool conversation_kv_verify(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
                             int64_t upto, bool index, uint64_t& fingerprint, std::string& error) {
     if (!conversation_kv_validate(image, st, g, upto, index, error)) return false;

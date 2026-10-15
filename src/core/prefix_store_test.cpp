@@ -220,6 +220,64 @@ void prefix_session(int fmt, int mode, const std::string& dir) {
         PrefixStore store;
         check(store.open(other,log,err) && store.size()==0,"a file cut short is dropped");
     }
+    {   // local patch (delta end points): an end point is stored as the bytes past an older snapshot of its tokens
+        at_root(13,40,root,ref);
+        PrefixStore::Options d=o;
+        d.ram_budget=0;
+        PrefixStore store;
+        check(store.open(d,log,err) && store.size()==0 && store.capture(root,true,ss,g,draft.state,log,err),
+              "delta: the root");
+        const size_t whole=store.disk_bytes();
+        check(store.restore(store.best(ids,{},true).key,ss,g,draft.state,source,err)==ConversationRestore::restored,
+              "delta: the session holds the root's bytes");
+        // the conversation goes on: cells from 40 on are new, then an end point of 60 tokens
+        auto end_point=[&](uint8_t salt,int64_t from,int64_t L,ConversationCheckpoint& c,SavedConversation& r) {
+            main.fill_after(salt,from); draft.fill_after(salt,from);
+            cuda_check(cudaDeviceSynchronize());
+            c={}; c.ids.assign(ids.begin(),ids.begin()+L);
+            check(conversation_checkpoint_save(c,ss,g,err),"delta: checkpoint");
+            check(conversation_checkpoint_restore(c,ss,g,err),"delta: spare row");
+            const ConversationView view{c.ids,none,no_checks,true};
+            check(conversation_snapshot_save(r,view,ss,g,draft.state,err),"delta: reference");
+        };
+        ConversationCheckpoint e1,e2,e3;
+        SavedConversation r1,r2,r3;
+        end_point(55,40,60,e1,r1);
+        check(store.capture(e1,true,ss,g,draft.state,log,err) && log.find("a delta on 40")!=std::string::npos &&
+              store.disk_bytes()-whole<whole,"delta: the end point is a delta on the root");
+        end_point(77,60,64,e2,r2);
+        check(store.capture(e2,true,ss,g,draft.state,log,err) && log.find("a delta on 60")!=std::string::npos &&
+              log.find("chain of 3")!=std::string::npos,"delta: the next end point on the previous one");
+        check(store.drop_superseded(e2.ids,{},40,true)==0 && store.size()==3,"delta: a base is not dropped");
+        fill(201);
+        check(store.restore(store.best(ids,{},true).key,ss,g,draft.state,source,err)==ConversationRestore::restored &&
+              source=="disk, 3 files" && restored(r2),"delta: a chain of three restores exactly");
+        fill(202);
+        std::vector<int32_t> p61(ids.begin(),ids.begin()+61);
+        check(store.restore(store.best(p61,{},true).key,ss,g,draft.state,source,err)==ConversationRestore::restored &&
+              restored(r1),"delta: the middle one too");
+        // other bytes for the same tokens (computed elsewhere): saved whole, not on them
+        fill(99);
+        e3={}; e3.ids.assign(ids.begin(),ids.begin()+50);
+        check(conversation_checkpoint_save(e3,ss,g,err) && conversation_checkpoint_restore(e3,ss,g,err),"delta: e3");
+        {
+            const ConversationView view{e3.ids,none,no_checks,true};
+            check(conversation_snapshot_save(r3,view,ss,g,draft.state,err),"delta: e3 reference");
+        }
+        check(store.capture(e3,true,ss,g,draft.state,log,err) && log.find("delta")==std::string::npos,
+              "delta: different bytes are saved whole");
+        PrefixStore again;
+        check(again.open(d,log,err) && again.size()==4,"delta: the chain survives a restart");
+        fill(203);
+        check(again.restore(again.best(ids,{},true).key,ss,g,draft.state,source,err)==ConversationRestore::restored &&
+              restored(r2),"delta: and restores exactly after it");
+        fill(204);
+        std::vector<int32_t> p51(ids.begin(),ids.begin()+51);
+        check(again.restore(again.best(p51,{},true).key,ss,g,draft.state,source,err)==ConversationRestore::restored &&
+              source=="disk" && restored(r3),"delta: the whole one restores exactly");
+        check(again.drop_superseded(std::vector<int32_t>(ids.begin(),ids.begin()+65),{},40,true)==3 &&
+              again.size()==1,"delta: superseded end points go once nothing is stored on them");
+    }
     fs::remove_all(dir);
 }
 }

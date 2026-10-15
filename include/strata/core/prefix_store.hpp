@@ -51,10 +51,13 @@ public:
     bool contains(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& imgs, bool cvec) const;
     // local patch (conversation end points on disk): drops the saved snapshots that are a strict prefix of `ids`
     // (pictures included) and longer than `above` tokens - the older end points of the same conversation; the
-    // system-prompt root (at most `above` tokens) stays.  Returns how many were dropped.
+    // system-prompt root (at most `above` tokens) stays, and so does one that a newer snapshot is stored on
+    // (a delta's base).  Returns how many were dropped.
     size_t drop_superseded(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& imgs, size_t above,
                            bool cvec);
-    // Saves the session's state at `root`, a checkpoint of what the session holds, to a new file.
+    // Saves the session's state at `root`, a checkpoint of what the session holds, to a new file.  local patch
+    // (delta end points): when a saved snapshot shares most of root's tokens and its bytes match the session's
+    // (sampled), the file holds only the bytes past them and links to it - the chain is read back on restore.
     bool capture(const ConversationCheckpoint& root, bool cvec, const SessionState& session, const ModelGeometry& g,
                  const QsaState& draft, std::string& log, std::string& error);
     // `source`: "ram", "disk>ram" (read into the RAM tier first) or "disk" (streamed).  An invalid file is
@@ -75,12 +78,25 @@ private:
         std::shared_ptr<SavedConversation> ram;
         size_t ram_bytes = 0;
         uint64_t used = 0;
+        // local patch (delta end points): bytes [0, from[j][i]) of layer j's payload i are the parent's; the
+        // file holds the rest, layer by layer, payload by payload, from file offset data_at on
+        uint64_t parent = 0, shape = 0, data_at = 0;
+        std::vector<ConversationKvSizes> sizes, from;
     };
     std::string path(uint64_t key) const;
     Entry* find(uint64_t key);
+    const Entry* find(uint64_t key) const;
     void erase(uint64_t key);
     void trim_disk(size_t incoming);
     bool trim_ram(size_t incoming);
+    void touch(uint64_t key);     // the entry and the chain it is stored on: most recently used
+    size_t depth(uint64_t key) const;
+    // byte ranges of layer j's payload i in [at, at + n), each from the chain entry that holds it
+    struct Span { const Entry* e; size_t at, n; };
+    bool spans(const Entry& e, size_t j, size_t i, size_t at, size_t n, std::vector<Span>& out) const;
+    uint64_t payload_at(const Entry& e, size_t j, size_t i) const;   // file offset of e's bytes of layer j payload i
+    ConversationRestore restore_chain(const Entry& e, SessionState& session, const ModelGeometry& g,
+                                      const QsaState& draft, std::string& source, std::string& error);
 
     Options o_;
     std::vector<Entry> entries_;

@@ -5223,13 +5223,23 @@ int main(int argc, char** argv) {
             // comes back then restores it (system prompt + its whole context) instead of reading its history again,
             // however many conversations rotate through the 4 RAM slots.  Its older end points go; the system-prompt
             // root stays.  One GPU; pictures are keyed by content hash in the prefix file.
-            if (prefixes.enabled() && stages.empty() && o.turn_token >= 0 && !checks.empty()) {
-                const ConvCheckpoint& tail = checks.back();
-                const int64_t n_tail = (int64_t) tail.ids.size();
+            if (prefixes.enabled() && stages.empty() && o.turn_token >= 0) {
+                // the conversation's deepest checkpoint (not the last in the list: a restored root can sit there)
+                const ConvCheckpoint* best = nullptr;
+                for (const ConvCheckpoint& c : checks) if (!best || c.ids.size() > best->ids.size()) best = &c;
+                const int64_t n_tail = best ? (int64_t) best->ids.size() : 0;
                 int64_t root_at = -1;
                 for (int64_t i = 1; i < n_tail; ++i)
-                    if (tail.ids[(size_t) i] == o.turn_token) { root_at = i; break; }
-                if (root_at > 0 && n_tail - root_at >= 1024 && !prefixes.contains(tail.ids, tail.imgs, cvec_cached)) {
+                    if (best->ids[(size_t) i] == o.turn_token) { root_at = i; break; }
+                const char* why = !best ? "no checkpoint" : root_at <= 0 ? "no turn boundary"
+                                : n_tail - root_at < 1024 ? "under 1024 tokens past the system prompt"
+                                : prefixes.contains(best->ids, best->imgs, cvec_cached) ? "already saved" : nullptr;
+                if (why)
+                    std::fprintf(stderr, "strata serve: prefix cache: end point not saved: %s (live %zu tokens, %zu "
+                                 "checkpoint%s, deepest %lld)\n", why, live.size(), checks.size(),
+                                 checks.size() == 1 ? "" : "s", (long long) n_tail);
+                if (!why) {
+                    const ConvCheckpoint& tail = *best;
                     std::string plog, perr;
                     const auto t0 = Clock::now();
                     if (prefixes.capture(tail, cvec_cached, ss, g, mtp.kv_state(), plog, perr)) {

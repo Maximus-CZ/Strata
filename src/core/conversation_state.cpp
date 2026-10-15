@@ -370,6 +370,93 @@ ConversationRestore conversation_prefix_restore_stream(const SavedConversation& 
     return ConversationRestore::restored;
 }
 
+void conversation_prefix_unchanged(const SavedConversation& meta, const std::vector<ConversationKvSizes>& sizes,
+                                   int64_t unchanged, std::vector<ConversationKvSizes>& from) {
+    from.assign(sizes.size(), ConversationKvSizes{});
+    if (unchanged <= 0) return;
+    const auto shapes = strata::kernels::qsa_real_shapes();
+    for (size_t j = 0; j < sizes.size() && j < meta.kv.size(); ++j) {
+        const auto& k = meta.kv[j];
+        if (k.cells <= 0 || k.page_size <= 0) continue;
+        const int64_t whole = std::min(k.cells, (unchanged / k.page_size) * k.page_size);
+        for (size_t i = 0; i < 4; ++i) from[j][i] = sizes[j][i] / (size_t) k.cells * (size_t) whole;
+        if (sizes[j][4] && k.idx_dim > 0)
+            from[j][4] = std::min(sizes[j][4],
+                                  (size_t) (unchanged / shapes.idx_block) * (size_t) k.idx_dim * sizeof(float));
+    }
+}
+
+bool conversation_prefix_save_stream_from(const SessionState& ss, const ModelGeometry& g, const QsaState& draft,
+                                          int64_t upto, const std::vector<ConversationKvSizes>& from,
+                                          std::vector<uint8_t>& bounce, const ConversationWrite& write,
+                                          std::string& error) {
+    if (!sync(error)) return false;
+    const size_t layers = owned_qsa(ss);
+    if (from.size() != layers + 1) return fail(error, "invalid delta layer count");
+    for (size_t j = 0; j <= layers; ++j)
+        if (!conversation_kv_save_stream_from(j < layers ? owned(ss, j) : draft, g, upto, j < layers, from[j], bounce,
+                                              write, error))
+            return false;
+    return true;
+}
+
+bool conversation_prefix_read(const SessionState& ss, const ModelGeometry& g, const QsaState& draft, int64_t upto,
+                              size_t layer, size_t array, size_t at, size_t n, uint8_t* out, std::string& error) {
+    const size_t layers = owned_qsa(ss);
+    if (layer > layers) return fail(error, "no such K/V layer");
+    return sync(error) &&
+           conversation_kv_read(layer < layers ? owned(ss, layer) : draft, g, upto, layer < layers, array, at, n, out,
+                                error);
+}
+
+ConversationRestore conversation_prefix_restore_pieces(const SavedConversation& meta,
+                                                       const std::vector<ConversationKvSizes>& sizes,
+                                                       SessionState& ss, const ModelGeometry& g,
+                                                       const QsaState& draft, std::vector<uint8_t>& bounce,
+                                                       const std::vector<ConversationKvPiece>& pieces,
+                                                       std::string& error) {
+    auto invalid = [&](const char* message) { fail(error, message); return ConversationRestore::invalid; };
+    if (!meta.live.stage_parts.empty() || !meta.checkpoints.empty() || !meta.stage_images.empty())
+        return invalid("not a prefix image");
+    if (meta.geometry != geometry_key(g)) return invalid("incompatible runtime geometry");
+    if (meta.layer_lo != ss.layer_lo || meta.layer_hi != ss.layer_hi)
+        return invalid("snapshot from another session layer range");
+    const ConversationView view{meta.live.ids, meta.live.imgs, meta.checkpoints, meta.cvec};
+    if (!view_validate(view, ss, g, error) || !conversation_checkpoint_validate(meta.live, ss, g, error))
+        return ConversationRestore::invalid;
+    const size_t layers = owned_qsa(ss);
+    if (meta.kv.size() != layers + 1 || sizes.size() != layers + 1) return invalid("invalid K/V layer count");
+    const int64_t upto = (int64_t) meta.live.ids.size();
+    // the pieces of each payload, in order: they must cover it exactly, no gap, no overlap
+    std::vector<std::vector<const ConversationKvPiece*>> per(layers + 1);
+    for (const auto& p : pieces) {
+        if (p.layer > layers || p.array >= 5 || !p.read) return invalid("invalid K/V piece");
+        if (p.n) per[p.layer].push_back(&p);
+    }
+    for (size_t j = 0; j <= layers; ++j) {
+        auto& v = per[j];
+        std::stable_sort(v.begin(), v.end(), [](const ConversationKvPiece* a, const ConversationKvPiece* b) {
+            return a->array != b->array ? a->array < b->array : a->at < b->at;
+        });
+        ConversationKvSizes end{};
+        for (const auto* p : v) {
+            if (p->at != end[p->array]) return invalid("K/V pieces leave a gap or overlap");
+            end[p->array] += p->n;
+        }
+        if (end != sizes[j]) return invalid("K/V pieces do not cover the payload");
+        if (!conversation_kv_validate_sizes(meta.kv[j], sizes[j], j < layers ? owned(ss, j) : draft, g, upto,
+                                            j < layers, error))
+            return ConversationRestore::invalid;
+    }
+    if (!sync(error)) return ConversationRestore::transfer_failed;
+    for (size_t j = 0; j <= layers; ++j)
+        if (!conversation_kv_restore_pieces(meta.kv[j], sizes[j], j < layers ? owned(ss, j) : draft, g, upto,
+                                            j < layers, bounce, per[j], error))
+            return ConversationRestore::transfer_failed;
+    if (!conversation_checkpoint_restore(meta.live, ss, g, error)) return ConversationRestore::transfer_failed;
+    return ConversationRestore::restored;
+}
+
 // the draft layer's K/V included (the stage that owns the draft head, or no layer split)
 bool conversation_snapshot_bytes(const ConversationView& view, const SessionState& ss, const ModelGeometry& g,
                                  const QsaState& draft, size_t& bytes, std::string& error) {

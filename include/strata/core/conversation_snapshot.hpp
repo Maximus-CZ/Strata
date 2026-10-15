@@ -52,6 +52,24 @@ bool conversation_kv_restore_stream(const ConversationKv& header, const Conversa
                                     bool include_index, std::vector<uint8_t>& bounce,
                                     const ConversationRead& read, std::string& error);
 
+// local patch (delta end points): byte b of a payload is the same cell (indexer row) in every image of one
+// geometry, so a snapshot can be stored as the bytes past an older snapshot of the same tokens plus a link to it.
+bool conversation_kv_save_stream_from(const QsaState& state, const ModelGeometry& g, int64_t upto, bool include_index,
+                                      const ConversationKvSizes& from, std::vector<uint8_t>& bounce,
+                                      const ConversationWrite& write, std::string& error);
+// bytes [at, at + n) of the session's payload `array` (k, v, k_scale, v_scale, pooled); caller synchronizes
+bool conversation_kv_read(const QsaState& state, const ModelGeometry& g, int64_t upto, bool include_index,
+                          size_t array, size_t at, size_t n, uint8_t* out, std::string& error);
+// bytes [at, at + n) of layer `layer`'s payload `array`, taken from `read` (which yields them in order)
+struct ConversationKvPiece {
+    size_t layer = 0, array = 0, at = 0, n = 0;
+    ConversationRead read;
+};
+bool conversation_kv_restore_pieces(const ConversationKv& header, const ConversationKvSizes& sizes,
+                                    const QsaState& state, const ModelGeometry& g, int64_t upto, bool include_index,
+                                    std::vector<uint8_t>& bounce, const std::vector<const ConversationKvPiece*>& pieces,
+                                    std::string& error);
+
 struct ConversationStateSizes {
     size_t gdn = 0, ple = 0, tail = 0, dead = 0, block_pos = 0;
 };
@@ -131,5 +149,23 @@ ConversationRestore conversation_prefix_restore_stream(const SavedConversation& 
                                                        SessionState& session, const ModelGeometry& g,
                                                        const QsaState& draft, std::vector<uint8_t>& bounce,
                                                        const ConversationRead& read, std::string& error);
+
+// local patch (delta end points): from[j][i] = the bytes of layer j's payload i that hold only cells and indexer
+// rows below `unchanged` tokens (whole pages, completed rows) - the same cells in any snapshot of these tokens
+void conversation_prefix_unchanged(const SavedConversation& meta, const std::vector<ConversationKvSizes>& sizes,
+                                   int64_t unchanged, std::vector<ConversationKvSizes>& from);
+bool conversation_prefix_save_stream_from(const SessionState& session, const ModelGeometry& g, const QsaState& draft,
+                                          int64_t upto, const std::vector<ConversationKvSizes>& from,
+                                          std::vector<uint8_t>& bounce, const ConversationWrite& write,
+                                          std::string& error);
+bool conversation_prefix_read(const SessionState& session, const ModelGeometry& g, const QsaState& draft, int64_t upto,
+                              size_t layer, size_t array, size_t at, size_t n, uint8_t* out, std::string& error);
+// conversation_prefix_restore_stream with the payloads in pieces that must tile every payload exactly
+ConversationRestore conversation_prefix_restore_pieces(const SavedConversation& meta,
+                                                       const std::vector<ConversationKvSizes>& sizes,
+                                                       SessionState& session, const ModelGeometry& g,
+                                                       const QsaState& draft, std::vector<uint8_t>& bounce,
+                                                       const std::vector<ConversationKvPiece>& pieces,
+                                                       std::string& error);
 
 } // namespace strata::core
