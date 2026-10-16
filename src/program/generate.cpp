@@ -5228,11 +5228,17 @@ int main(int argc, char** argv) {
                 const ConvCheckpoint* best = nullptr;
                 for (const ConvCheckpoint& c : checks) if (!best || c.ids.size() > best->ids.size()) best = &c;
                 const int64_t n_tail = best ? (int64_t) best->ids.size() : 0;
-                int64_t root_at = -1;
+                int64_t root_at = -1, turns = 0;
                 for (int64_t i = 1; i < n_tail; ++i)
-                    if (best->ids[(size_t) i] == o.turn_token) { root_at = i; break; }
+                    if (best->ids[(size_t) i] == o.turn_token) { if (root_at < 0) root_at = i; }
+                for (int64_t i = 0; i < n_tail; ++i) turns += best->ids[(size_t) i] == o.turn_token;
+                // local patch (2026-10-16): only a conversation that already came back once (system, user, assistant,
+                // user...) is worth a file - a first turn is usually a one-off (a SubSync verifier or whole-file
+                // question, a web_fetch summary: 13 x 855 MB in 3 min flushed the store); and a tail under 2048 tokens
+                // is read again in ~3 s, cheaper than writing and restoring 130+ MB
                 const char* why = !best ? "no checkpoint" : root_at <= 0 ? "no turn boundary"
-                                : n_tail - root_at < 1024 ? "under 1024 tokens past the system prompt"
+                                : turns < 4 ? "a first turn (saved once the conversation comes back)"
+                                : n_tail - root_at < 2048 ? "under 2048 tokens past the system prompt"
                                 : prefixes.contains(best->ids, best->imgs, cvec_cached) ? "already saved" : nullptr;
                 if (why)
                     std::fprintf(stderr, "strata serve: prefix cache: end point not saved: %s (live %zu tokens, %zu "

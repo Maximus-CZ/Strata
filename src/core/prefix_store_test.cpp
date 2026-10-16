@@ -277,6 +277,33 @@ void prefix_session(int fmt, int mode, const std::string& dir) {
               source=="disk" && restored(r3),"delta: the whole one restores exactly");
         check(again.drop_superseded(std::vector<int32_t>(ids.begin(),ids.begin()+65),{},40,true)==3 &&
               again.size()==1,"delta: superseded end points go once nothing is stored on them");
+        // siblings: questions on one root share a few tokens past it, computed in other sessions (other bytes).
+        // Three of them, then a fourth: it must still be a delta on the root, not saved whole (2026-10-16)
+        auto sibling=[&](uint8_t salt,int k,ConversationCheckpoint& c,SavedConversation& r) {
+            fill(240);
+            check(again.restore(again.best(ids,{},true).key,ss,g,draft.state,source,err)==ConversationRestore::restored,
+                  "siblings: from the root");
+            main.fill_after(salt,40); draft.fill_after(salt,40);
+            cuda_check(cudaDeviceSynchronize());
+            c={}; c.ids.assign(ids.begin(),ids.begin()+49);
+            for (int j=0;j<11;++j) c.ids.push_back(1000*k+j);
+            check(conversation_checkpoint_save(c,ss,g,err) && conversation_checkpoint_restore(c,ss,g,err),"siblings: point");
+            const ConversationView view{c.ids,none,no_checks,true};
+            check(conversation_snapshot_save(r,view,ss,g,draft.state,err),"siblings: reference");
+        };
+        ConversationCheckpoint s1,s2,s3,s4;
+        SavedConversation q1,q2,q3,q4;
+        sibling(71,1,s1,q1); check(again.capture(s1,true,ss,g,draft.state,log,err),"siblings: 1");
+        sibling(72,2,s2,q2); check(again.capture(s2,true,ss,g,draft.state,log,err),"siblings: 2");
+        sibling(73,3,s3,q3); check(again.capture(s3,true,ss,g,draft.state,log,err),"siblings: 3");
+        sibling(74,4,s4,q4);
+        check(again.capture(s4,true,ss,g,draft.state,log,err) && log.find("a delta on 40")!=std::string::npos,
+              "siblings: the fourth is a delta on the root, not on a sibling or whole");
+        fill(241);
+        std::vector<int32_t> next=s4.ids; next.push_back(9);
+        check(again.best(next,{},true).tokens==(int64_t)s4.ids.size() &&
+              again.restore(again.best(next,{},true).key,ss,g,draft.state,source,err)==ConversationRestore::restored &&
+              restored(q4),"siblings: and it restores exactly");
     }
     fs::remove_all(dir);
 }

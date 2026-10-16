@@ -408,9 +408,15 @@ bool PrefixStore::capture(const ConversationCheckpoint& root, bool cvec, const S
                 }
             if (c > 0) bases.push_back({c, &e});
         }
-        std::stable_sort(bases.begin(), bases.end(), [](const auto& x, const auto& y) { return x.first > y.first; });
-        // the closest one may hold the last shared cells computed in another session (sampled bytes differ): the
-        // next closest - usually the system-prompt root this session was restored from - is tried then
+        // a snapshot that is wholly a prefix of this one (its system-prompt root, its own earlier end points) first,
+        // most shared tokens first; then the rest.  A sibling (another question on the same root) shares a few more
+        // tokens, but those cells were computed in another session and fail the byte check (2026-10-16: SubSync's
+        // whole-file questions tried three siblings and saved 855 MB whole each time, the root never tried).
+        std::stable_sort(bases.begin(), bases.end(), [](const auto& x, const auto& y) {
+            const bool px = (int64_t) x.second->ids.size() == x.first, py = (int64_t) y.second->ids.size() == y.first;
+            return px != py ? px : x.first > y.first;
+        });
+        // the closest one may still hold cells computed in another session (sampled bytes differ): the next is tried
         for (size_t tried = 0; tried < bases.size() && tried < 3 && !parent; ++tried) {
             const Entry* base = bases[tried].second;
             shared = bases[tried].first;
