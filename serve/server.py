@@ -2383,7 +2383,7 @@ class Service:
                         self.ensure_loaded()
                     with self.status_lock:
                         st.update(busy=True, phase="reading the prompt", prompt_tokens=len(ids),
-                                  kind=request_kind(sampling), read=None, read_first=None,
+                                  kind=request_kind(sampling), read=None, read_first=None, read_at=None,
                                   generated=0, started=time.time(), first_token=None, tool=None, tail="",
                                   max_tokens=max_new)
                         if par:
@@ -2405,6 +2405,8 @@ class Service:
                                     pr = getattr(self.engine, "progress", None) if n == 0 else None
                                     if pr and pr[1]:
                                         with self.status_lock:
+                                            if st.get("read") != int(pr[0]):
+                                                st["read_at"] = time.time()   # when the engine reported it
                                             st["read"] = int(pr[0])
                                             if st.get("read_first") is None:
                                                 st["read_first"] = (time.time(), int(pr[0]))
@@ -2734,16 +2736,23 @@ def status_line(svc) -> dict:
     head = f"{s['kind']}: " if s.get("kind") else ""
     phase, n = s.get("phase") or "busy", int(s.get("prompt_tokens") or 0)
     el = now - s.get("started", now)
+    # the fields, for a display that keeps its layout and moves the numbers between polls (patch-qwen-webui.py)
+    f = {"busy": True, "kind": s.get("kind"), "phase": phase, "prompt": n, "elapsed": round(el, 2), "queued": q,
+         "read": None, "read_rate": None, "generated": None, "gen_rate": None}
     if s.get("first_token") is None:
-        r, first = s.get("read"), s.get("read_first")
+        r, first, at = s.get("read"), s.get("read_first"), s.get("read_at")
+        f["read"] = r
         txt = f"{head}reading the prompt " + (f"{r:,} / {n:,} tokens" if r is not None else f"({n:,} tokens)")
-        if r is not None and first and now - first[0] > 0.5 and r > first[1]:
-            rate = (r - first[1]) / (now - first[0])
+        if r is not None and first and at and at - first[0] > 0.3 and r > first[1]:
+            rate = (r - first[1]) / (at - first[0])   # between the engine's chunk reports, not to now
+            f["read_rate"] = round(rate)
+            f["read_age"] = round(now - at, 2)         # how old `read` is: the display moves it on at read_rate
             txt += f" · {rate:,.0f} tok/s · ~{(n - r) / rate:.0f} s left"
     else:
         g = int(s.get("generated") or 0)
+        f["generated"], f["gen_rate"] = g, round(svc._tok_s(), 1)
         txt = f"{head}{phase} · {g:,} tokens · {svc._tok_s():.0f} tok/s · prompt {n:,}"
-    return {"text": f"{txt} · {el:.0f} s{wait}", "busy": True}
+    return {"text": f"{txt} · {el:.0f} s{wait}", **f}
 
 
 # ------------------------------------------------------------------------------------------------ live status
@@ -3232,7 +3241,7 @@ def make_handler(svc: Service):
                         if now - t1 > 0.5 and s["read"] > r1:
                             s["read_tok_s"] = round((s["read"] - r1) / (now - t1))
                             s["read_left_s"] = round((s.get("prompt_tokens", 0) - s["read"]) / s["read_tok_s"])
-                for k in ("started", "first_token", "read_first"):
+                for k in ("started", "first_token", "read_first", "read_at"):
                     s.pop(k, None)
                 self._json(200, s)
             elif path in ("/v1/models", "/models"):
