@@ -2383,6 +2383,7 @@ class Service:
                         self.ensure_loaded()
                     with self.status_lock:
                         st.update(busy=True, phase="reading the prompt", prompt_tokens=len(ids),
+                                  kind=request_kind(sampling), read=None, read_first=None,
                                   generated=0, started=time.time(), first_token=None, tool=None, tail="",
                                   max_tokens=max_new)
                         if par:
@@ -2402,6 +2403,11 @@ class Service:
                                 if t is None:               # heartbeat while the engine is quiet
                                     last_print = self._progress(last_print, st=st)
                                     pr = getattr(self.engine, "progress", None) if n == 0 else None
+                                    if pr and pr[1]:
+                                        with self.status_lock:
+                                            st["read"] = int(pr[0])
+                                            if st.get("read_first") is None:
+                                                st["read_first"] = (time.time(), int(pr[0]))
                                     yield "ping", ({"read": pr[0], "of": pr[1]} if pr and pr[1] else None)
                                     continue
                                 n += 1
@@ -2702,6 +2708,44 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
     yield "done", {**done, "completion_tokens": total, "prompt_tokens": len(ids)}
 
 
+def request_kind(req) -> str | None:
+    """local patch (2026-10-16): what a request is, for /status - Qwen Code's history compression has a system prompt
+    of its own (it asks for a <state_snapshot>), so the cache cannot help it and it reads the whole conversation."""
+    try:
+        system = " ".join(str(m.get("content") or "") for m in (req or {}).get("messages") or []
+                          if isinstance(m, dict) and m.get("role") in ("system", "developer"))
+    except AttributeError:
+        return None
+    return "compressing the conversation" if "<state_snapshot>" in system else None
+
+
+def status_line(svc) -> dict:
+    """local patch (2026-10-16): what the model is doing as one line, for Qwen Code's web UI (its bar shows only an
+    arrow, a characters/4 count and the time). GET /status/line needs no key: phases and numbers only, never the
+    text of a conversation (that is why /status needs one, #212). NPM serves it as the public web UI host/strata-status
+    behind Authentik."""
+    with svc.status_lock:
+        s = dict(svc.status)
+    now = time.time()
+    q = int(s.get("queued") or 0)
+    wait = f" · {q} more waiting" if q else ""
+    if not s.get("busy"):
+        return {"text": "Strata idle" + wait, "busy": False}
+    head = f"{s['kind']}: " if s.get("kind") else ""
+    phase, n = s.get("phase") or "busy", int(s.get("prompt_tokens") or 0)
+    el = now - s.get("started", now)
+    if s.get("first_token") is None:
+        r, first = s.get("read"), s.get("read_first")
+        txt = f"{head}reading the prompt " + (f"{r:,} / {n:,} tokens" if r is not None else f"({n:,} tokens)")
+        if r is not None and first and now - first[0] > 0.5 and r > first[1]:
+            rate = (r - first[1]) / (now - first[0])
+            txt += f" · {rate:,.0f} tok/s · ~{(n - r) / rate:.0f} s left"
+    else:
+        g = int(s.get("generated") or 0)
+        txt = f"{head}{phase} · {g:,} tokens · {svc._tok_s():.0f} tok/s · prompt {n:,}"
+    return {"text": f"{txt} · {el:.0f} s{wait}", "busy": True}
+
+
 # ------------------------------------------------------------------------------------------------ live status
 class LiveStatus:
     """local patch (2026-10-16): while a request waits for the model or its prompt is read, the stream says so as
@@ -2752,11 +2796,9 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
     calls = 0
     streamed = {}                                  # tool call id -> index, for calls sent piece by piece
     finished = set()                               # ... and the ones whose final tool_call came (#211)
-    live = LiveStatus() if thinking else None      # local patch: the wait and the prompt read, shown while they last
     for kind, x in run if run is not None else svc.run(ids, thinking, tools, max_new, req, cancel):
         if kind == "ping":
-            line = live.line(x) if live is not None and x else None
-            yield chunk({"reasoning_content": line}) if line else None
+            yield None
         elif kind == "mcp":
             c = chunk({})
             c["strata_mcp"] = x
@@ -3172,6 +3214,8 @@ def make_handler(svc: Service):
                 self._json(200, {"status": "ok", "max_context": svc.engine.max_context, "model": svc.model,
                                  "images": svc.vision is not None, "api_key": bool(svc.api_key),
                                  "loaded": svc.loaded(), "service": "strata"})
+            elif path == "/status/line":                    # local patch: no key - no text of any conversation
+                self._json(200, status_line(svc))
             elif path == "/status":
                 if not self._authorized():                  # #212: it shows the end of the last answer
                     return
@@ -3183,7 +3227,12 @@ def make_handler(svc: Service):
                     if s.get("first_token"):
                         s["tokens_per_s"] = round(svc._tok_s(), 1)
                         s["tokens_per_s_mean"] = round(svc._tok_s_mean(), 1)
-                for k in ("started", "first_token"):
+                    elif s.get("read") is not None and s.get("read_first"):   # local patch: the prompt read
+                        t1, r1 = s["read_first"]
+                        if now - t1 > 0.5 and s["read"] > r1:
+                            s["read_tok_s"] = round((s["read"] - r1) / (now - t1))
+                            s["read_left_s"] = round((s.get("prompt_tokens", 0) - s["read"]) / s["read_tok_s"])
+                for k in ("started", "first_token", "read_first"):
                     s.pop(k, None)
                 self._json(200, s)
             elif path in ("/v1/models", "/models"):
