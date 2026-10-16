@@ -52,7 +52,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
 from serve.frontend import (ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
-                            images_of, mark_think_literals, openai_to_messages, unmark_think_literals)
+                            images_of, mark_think_literals, openai_to_messages, unmark_think_literals,
+                            STATUS_MARK)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
 from serve.winjob import contain  # noqa: E402
@@ -1263,6 +1264,8 @@ class Vision:
     """The resident image encoder: `strata-vision` (llama.cpp mtmd + the mmproj file) reads `ENC <image> <out>`
     lines and writes each image's embeddings; results are cached by the image's hash, so a conversation that
     sends the same picture again (every turn, with most clients) encodes it once."""
+    lazy = False        # local patch: class defaults, so an instance made without __init__ (tests) is resident
+    idle_s = 0
 
     def __init__(self, cfg: dict, log=None, env: dict | None = None):
         args = [cfg["exe"], "--mmproj", cfg["mmproj"], "--model", cfg["model"]]
@@ -2351,9 +2354,23 @@ class Service:
         rate = collections.deque(maxlen=32) if par else self.rate
         with self.status_lock:
             self.status["queued"] += 1
+        held = False
         try:
+            # local patch (2026-10-16): wait for the model in steps, so the stream can show the wait (live status)
+            if not getattr(self.engine, "batch", 0) and isinstance(self.fifo, type(threading.Lock())):
+                try:
+                    while not self.fifo.acquire(timeout=2.0):
+                        with self.status_lock:
+                            q = {"queue": max(0, int(self.status.get("queued") or 1) - 1),
+                                 "busy": bool(self.status.get("busy")), "phase": self.status.get("phase")}
+                        yield "ping", q
+                except BaseException:              # the client left while it waited: no longer queued
+                    with self.status_lock:
+                        self.status["queued"] -= 1
+                    raise
+                held = True
             # --batch: the engine runs several requests at once (StrataEngine.generate_batched orders them)
-            with (contextlib.nullcontext() if getattr(self.engine, "batch", 0) else self.fifo):
+            with (contextlib.nullcontext() if getattr(self.engine, "batch", 0) or held else self.fifo):
                 try:
                     with self.status_lock:
                         if trace is not None:
@@ -2384,7 +2401,8 @@ class Service:
                             for t in gen:
                                 if t is None:               # heartbeat while the engine is quiet
                                     last_print = self._progress(last_print, st=st)
-                                    yield "ping", None
+                                    pr = getattr(self.engine, "progress", None) if n == 0 else None
+                                    yield "ping", ({"read": pr[0], "of": pr[1]} if pr and pr[1] else None)
                                     continue
                                 n += 1
                                 if trace is not None and trace["first_token_s"] is None:
@@ -2540,6 +2558,8 @@ class Service:
                                 self.status.pop("tail", None)
                                 self.status.pop("tool", None)
         finally:
+            if held:
+                self.fifo.release()
             if emb:
                 Path(emb).unlink(missing_ok=True)
         for ev in parser.finish():
@@ -2682,6 +2702,41 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
     yield "done", {**done, "completion_tokens": total, "prompt_tokens": len(ids)}
 
 
+# ------------------------------------------------------------------------------------------------ live status
+class LiveStatus:
+    """local patch (2026-10-16): while a request waits for the model or its prompt is read, the stream says so as
+    thinking text, one line every EVERY_S - Qwen Code otherwise shows only "processing". Each line starts with
+    frontend.STATUS_MARK; frontend.openai_to_messages strips such lines from a later request's reasoning_content, so
+    they never reach the model (nor change the prompt, which the prefix cache needs unchanged)."""
+    EVERY_S = 2.0
+
+    def __init__(self):
+        self.last_t, self.first, self.t0 = 0.0, None, time.time()
+
+    def line(self, x: dict) -> str | None:
+        now = time.time()
+        if now - self.last_t < self.EVERY_S:
+            return None
+        if "queue" in x:
+            self.last_t = now
+            ahead = x["queue"]
+            return (f"{STATUS_MARK} waiting for the model: it is {x.get('phase') or 'busy'} with another request"
+                    + (f", {ahead} more waiting before this one" if ahead else "") + f" ({now - self.t0:.0f} s)\n")
+        read, total = int(x.get("read") or 0), int(x.get("of") or 0)
+        if not total:
+            return None
+        if self.first is None:                     # the first sample: what was restored counts as read already
+            self.first = (now, read)
+            self.last_t = now
+            return f"{STATUS_MARK} reading the prompt: {read:,} of {total:,} tokens (from the cache or read so far)\n"
+        self.last_t = now
+        dt, dn = now - self.first[0], read - self.first[1]
+        rate = dn / dt if dt > 0 else 0.0
+        left = (total - read) / rate if rate > 1 else None
+        return (f"{STATUS_MARK} reading the prompt: {read:,} of {total:,} tokens, {rate:,.0f} tok/s"
+                + (f", ~{left:.0f} s left" if left is not None else "") + "\n")
+
+
 # ------------------------------------------------------------------------------------------------ OpenAI
 def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, run=None):
     """`run`: the events to send instead of Service.run's (run_with_mcp); its ("mcp", {...}) items become chunks with
@@ -2697,9 +2752,11 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
     calls = 0
     streamed = {}                                  # tool call id -> index, for calls sent piece by piece
     finished = set()                               # ... and the ones whose final tool_call came (#211)
+    live = LiveStatus() if thinking else None      # local patch: the wait and the prompt read, shown while they last
     for kind, x in run if run is not None else svc.run(ids, thinking, tools, max_new, req, cancel):
         if kind == "ping":
-            yield None
+            line = live.line(x) if live is not None and x else None
+            yield chunk({"reasoning_content": line}) if line else None
         elif kind == "mcp":
             c = chunk({})
             c["strata_mcp"] = x

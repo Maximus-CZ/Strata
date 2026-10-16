@@ -257,6 +257,17 @@ def _tool_list(value, wrapper: str | None) -> list[dict]:
     return tools
 
 
+# local patch (2026-10-16): the live status lines the server streams as thinking text while a request waits or its
+# prompt is read (server.LiveStatus). Clients send their reasoning back; these lines are removed so the model never
+# sees them and the prompt stays what it was (the prefix cache matches it).
+STATUS_MARK = "⏳ Strata:"
+_STATUS_LINE = re.compile("^" + re.escape(STATUS_MARK) + r"[^\n]*\n?", re.M)
+
+
+def strip_status(text: str) -> str:
+    return _STATUS_LINE.sub("", text) if STATUS_MARK in text else text
+
+
 def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
     """OpenAI Chat Completions -> (template messages, template tools, template kwargs)."""
     messages = []
@@ -265,8 +276,8 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
         if role == "developer":
             role = "system"
         out = {"role": role, "content": _parts_of(m.get("content")) if role in ("user", "tool", "assistant") else _text_of(m.get("content"))}
-        if m.get("reasoning_content"):
-            out["reasoning_content"] = m["reasoning_content"]
+        if m.get("reasoning_content") and strip_status(m["reasoning_content"]):
+            out["reasoning_content"] = strip_status(m["reasoning_content"])
         if m.get("tool_calls"):
             calls = []
             for c in _object_list(m["tool_calls"], "tool_calls"):
