@@ -1756,6 +1756,7 @@ class Service:
         self.allowed_hosts: list[str] = []
         self.host_names: set[str] = set(LOOPBACK_NAMES)
         self.status = {"busy": False, "queued": 0}      # GET /status: what the model is doing right now
+        self.miss_watch = CacheMissWatch(Path(__file__).resolve().parents[1] / "cache-misses.jsonl")
         self.rate = collections.deque(maxlen=32)        # (time, generated) samples for the live tok/s window
         # "parallel" (the engine's batch slots): every running request's own status and rate window; self.status
         # then says busy while any runs and shows the newest one
@@ -2572,6 +2573,14 @@ class Service:
                 Path(emb).unlink(missing_ok=True)
         for ev in parser.finish():
             yield "event", ev
+        if timings and finish != "cancel" and getattr(self, "miss_watch", None) is not None:
+            try:                                # local patch: a continuing conversation must not read again
+                miss = self.miss_watch.check(ids, int(timings.get("cache_n") or 0))
+                if miss:
+                    with self.status_lock:
+                        self.status["last_miss"] = miss
+            except Exception as e:  # noqa: BLE001 -- a watch never fails a request
+                print(f"[strata] cache-miss watch failed: {type(e).__name__}: {e}", flush=True)
         yield "done", {"finish": finish, "completion_tokens": n, "reused": (timings or {}).get("cache_n", 0),
                        "timings": timings, "reasoning_tokens": thinking_n}
 
@@ -2710,6 +2719,57 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
     yield "done", {**done, "completion_tokens": total, "prompt_tokens": len(ids)}
 
 
+class CacheMissWatch:
+    """local patch (2026-10-16): "any cache miss should be investigated". The token ids of the last KEEP finished
+    requests are kept; a new request's longest common start with any of them was in the cache once (that state existed
+    at the end of reading it). Reusing more than SLACK tokens less than that is a cache miss: logged, appended to
+    cache-misses.jsonl and shown in /status/line for MISS_SHOW_S. Qwen's history compression starts differently and is
+    no miss. A miss right after an engine restart (a rebuilt engine wipes the prefix store) says so in `up_s`."""
+    KEEP, SLACK, MISS_SHOW_S = 64, 2048, 60
+
+    def __init__(self, path):
+        self.path, self.recent, self.started = Path(path), collections.deque(maxlen=self.KEEP), time.time()
+
+    @staticmethod
+    def common(a: memoryview, b: memoryview) -> int:
+        """The tokens two id sequences (int32 bytes) share from the start: a binary search over memcmp-ed slices."""
+        lo, hi = 0, min(len(a), len(b)) // 4
+        if a[:4 * hi] == b[:4 * hi]:
+            return hi
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if a[:4 * mid] == b[:4 * mid]:
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo
+
+    def check(self, ids, reused: int) -> dict | None:
+        import array
+        cur = memoryview(array.array("i", ids).tobytes())
+        best, when = 0, None
+        for t, prev in self.recent:
+            c = self.common(cur, prev)
+            if c > best:
+                best, when = c, t
+        now = time.time()
+        self.recent.append((now, cur))
+        if best - reused <= self.SLACK:
+            return None
+        miss = {"at": time.strftime("%Y-%m-%d %H:%M:%S"), "t": now, "prompt": len(ids), "reused": reused,
+                "could": best, "missed": best - reused, "prev_age_s": round(now - when, 1),
+                "up_s": round(now - self.started, 1)}
+        print(f"[strata] CACHE MISS: reused {reused:,} of {len(ids):,} tokens, but {best:,} were cached by a request "
+              f"{miss['prev_age_s']:.0f} s ago - {miss['missed']:,} tokens read again (server up {miss['up_s']:.0f} s); "
+              f"logged to {self.path}", flush=True)
+        try:
+            with open(self.path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(miss) + "\n")
+        except OSError:
+            pass
+        return miss
+
+
 def request_kind(req) -> str | None:
     """local patch (2026-10-16): what a request is, for /status - Qwen Code's history compression has a system prompt
     of its own (it asks for a <state_snapshot>), so the cache cannot help it and it reads the whole conversation."""
@@ -2732,7 +2792,9 @@ def status_line(svc) -> dict:
     q = int(s.get("queued") or 0)
     wait = f" · {q} more waiting" if q else ""
     if not s.get("busy"):
-        return {"text": "Strata idle" + wait, "busy": False}
+        m = s.get("last_miss")
+        miss = {"missed": m["missed"], "age_s": round(now - m["t"])} if m and now - m["t"] < 60 else None
+        return {"text": "Strata idle" + wait, "busy": False, "miss": miss}
     head = f"{s['kind']}: " if s.get("kind") else ""
     phase, n = s.get("phase") or "busy", int(s.get("prompt_tokens") or 0)
     el = now - s.get("started", now)
@@ -2752,6 +2814,9 @@ def status_line(svc) -> dict:
         g = int(s.get("generated") or 0)
         f["generated"], f["gen_rate"] = g, round(svc._tok_s(), 1)
         txt = f"{head}{phase} · {g:,} tokens · {svc._tok_s():.0f} tok/s · prompt {n:,}"
+    m = s.get("last_miss")
+    if m and now - m["t"] < CacheMissWatch.MISS_SHOW_S:      # local patch: a miss is shown for a minute
+        f["miss"] = {"missed": m["missed"], "age_s": round(now - m["t"])}
     return {"text": f"{txt} · {el:.0f} s{wait}", **f}
 
 
