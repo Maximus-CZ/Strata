@@ -1865,7 +1865,7 @@ class Service:
         return self.vision is not None and hasattr(self.vision, "alive") and not self.vision.alive()
 
     VISION_FREE_MAX_MIB = 2048   # local patch: more free VRAM than this means the engine is not (fully) on the GPU
-    VISION_RESERVE_MIN_MIB = 384  # ... and never less left free after a regrow (a loaded engine leaves ~400 MiB)
+    VISION_RESERVE_MIN_MIB = 256  # ... and never less left free after a regrow (2026-10-17: 384 -> 256, dwm holds 1.8 GB at 4K)
 
     def free_vram_mib(self) -> int | None:
         """Free VRAM on the engine's (first) GPU, from NVML (AMD backend: amdgpu's sysfs files, #301); None when it can't
