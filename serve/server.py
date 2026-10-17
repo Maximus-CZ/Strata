@@ -1744,6 +1744,21 @@ class Service:
                     out = self.engine.vram(reserve) or {}
             vision.before_start = lend
             vision.after_stop = take_back
+
+            def regrow_if_short():
+                """local patch (2026-10-17): the take_back stops at the floor when other apps hold more VRAM just then
+                (Firefox, Discord: 92 % of the cache, prompt chunk 2048, ~770 tok/s instead of ~1130 - the chunk is lent
+                from the cache and is 4096 only near full). Before a request, at most every 30 s, while the encoder is
+                stopped: try again to the same floor."""
+                v = (getattr(self.engine, "info", None) or {}).get("vram") or {}
+                if not v or int(v.get("expert_slots") or 0) >= int(v.get("expert_slots_full") or 0) or vision.alive()                         or time.time() - getattr(self, "_regrow_tried", 0.0) < 30:
+                    return
+                self._regrow_tried = time.time()
+                try:
+                    take_back()
+                except Exception as e:  # noqa: BLE001 -- a regrow never fails a request
+                    print(f"[strata] regrow failed: {type(e).__name__}: {e}", flush=True)
+            self.regrow_if_short = regrow_if_short
         self.fit_max_tokens = fit_max_tokens          # --fit-max-tokens: clamp the output cap instead of 400
         self.aliases: list[str] = []                  # #297: other names of the model (the config's `aliases`)
         self.sampling_defaults = dict(sampling_defaults or {})   # the run config's `sampling` block
@@ -2411,6 +2426,8 @@ class Service:
                     # (parallel requests do not hold the fifo: one of them starts it, the others wait for that)
                     with (self.fifo if par else contextlib.nullcontext()):
                         self.ensure_loaded()
+                    if not par and getattr(self, "regrow_if_short", None):   # local patch: the cache full again
+                        self.regrow_if_short()
                     with self.status_lock:
                         st.update(busy=True, phase="reading the prompt", prompt_tokens=len(ids),
                                   kind=request_kind(sampling), read=None, read_first=None, read_at=None,
