@@ -1718,8 +1718,16 @@ class Service:
             # back to exactly the VRAM that was free before (not the start's default reserve: at load the engine
             # fills the card further, and VRAM None would leave ~20 % of the expert cache empty until a restart)
             def lend(mib):
-                if getattr(self, "_vision_free_before", None) is None:   # once: later figures are after a regrow
-                    self._vision_free_before = self.free_vram_mib()
+                # once: later figures are after a regrow. Only a figure of the LOADED engine counts: 2026-10-17 the
+                # first encoder start after a restart came while the engine was not on the GPU, 9600 MiB were "free
+                # before", and every take_back kept 9472 MiB free - the expert cache stayed at its floor and prompts
+                # read at 164 tok/s instead of ~1100. A loaded engine fills the card to its reserve (~400 MiB free).
+                if getattr(self, "_vision_free_before", None) is None and self.loaded():
+                    free = self.free_vram_mib()
+                    if free is not None and free < self.VISION_FREE_MAX_MIB:
+                        self._vision_free_before = free
+                    else:
+                        print(f"[strata] vision: {free} MiB free is no loaded engine's figure - not kept", flush=True)
                 self.engine.vram(mib)
 
             def take_back():
@@ -1834,6 +1842,8 @@ class Service:
             return False                                # local patch: a lazy encoder is down on purpose
         return self.vision is not None and hasattr(self.vision, "alive") and not self.vision.alive()
 
+    VISION_FREE_MAX_MIB = 2048   # local patch: more free VRAM than this means the engine is not (fully) on the GPU
+
     def free_vram_mib(self) -> int | None:
         """Free VRAM on the engine's (first) GPU, from NVML (AMD backend: amdgpu's sysfs files, #301); None when it can't
         be read (then nothing is refused)."""
@@ -1884,6 +1894,7 @@ class Service:
             code = self.engine.exit_code() if hasattr(self.engine, "exit_code") else None
             print(f"[strata] the engine had stopped (exit code {code}); starting it again "
                   "(a minute or two) ...", flush=True)
+        self._vision_free_before = None                 # local patch: a new engine, a new VRAM figure
         self.engine.restart()
         print("[strata] the engine is running again", flush=True)
         if self.vram_reserve is not None and hasattr(self.engine, "vram"):   # #533: the reserve asked for last
