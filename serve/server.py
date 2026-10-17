@@ -1746,16 +1746,16 @@ class Service:
             vision.after_stop = take_back
 
             def regrow_if_short():
-                """local patch (2026-10-17): the take_back stops at the floor when other apps hold more VRAM just then
-                (Firefox, Discord: 92 % of the cache, prompt chunk 2048, ~770 tok/s instead of ~1130 - the chunk is lent
-                from the cache and is 4096 only near full). Before a request, at most every 30 s, while the encoder is
-                stopped: try again to the same floor."""
+                """local patch (2026-10-17): the take_back stops at the floor while Windows has not yet freed the
+                stopped encoder's VRAM (431 MiB free then, 936 a minute later): 92 % of the cache, prompt chunk 2048,
+                ~770 tok/s instead of ~1130 - the chunk is lent from the cache and is 4096 only near full. Before a
+                request, at most every 30 s, while the encoder is stopped: grow to the floor again."""
                 v = (getattr(self.engine, "info", None) or {}).get("vram") or {}
                 if not v or int(v.get("expert_slots") or 0) >= int(v.get("expert_slots_full") or 0) or vision.alive()                         or time.time() - getattr(self, "_regrow_tried", 0.0) < 30:
                     return
                 self._regrow_tried = time.time()
-                try:
-                    take_back()
+                try:            # straight to the floor: it only grows (a take_back from its first figure shrank first)
+                    self.engine.vram(self.VISION_RESERVE_MIN_MIB)
                 except Exception as e:  # noqa: BLE001 -- a regrow never fails a request
                     print(f"[strata] regrow failed: {type(e).__name__}: {e}", flush=True)
             self.regrow_if_short = regrow_if_short
