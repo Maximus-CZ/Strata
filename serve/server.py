@@ -1734,7 +1734,14 @@ class Service:
                 before = getattr(self, "_vision_free_before", None)
                 # a little under it: the regrow stops a segment short and the prompt path's buffers move (measured
                 # -165 slots at the same figure, 64 MiB segments)
-                self.engine.vram(max(256, int(before) - 128) if before else None)
+                reserve = max(self.VISION_RESERVE_MIN_MIB, int(before) - 128) if before else None
+                out = self.engine.vram(reserve) or {}
+                # local patch (2026-10-17): one figure regrew the cache to 87 % only (1329 of 1529 slots, prompt chunk
+                # 2048: ~760 tok/s instead of ~1100) - step the reserve down until it is full, never under the floor
+                while reserve is not None and reserve > self.VISION_RESERVE_MIN_MIB and \
+                        int(out.get("expert_slots") or 0) < int(out.get("expert_slots_full") or 0):
+                    reserve = max(self.VISION_RESERVE_MIN_MIB, reserve - 128)
+                    out = self.engine.vram(reserve) or {}
             vision.before_start = lend
             vision.after_stop = take_back
         self.fit_max_tokens = fit_max_tokens          # --fit-max-tokens: clamp the output cap instead of 400
@@ -1843,6 +1850,7 @@ class Service:
         return self.vision is not None and hasattr(self.vision, "alive") and not self.vision.alive()
 
     VISION_FREE_MAX_MIB = 2048   # local patch: more free VRAM than this means the engine is not (fully) on the GPU
+    VISION_RESERVE_MIN_MIB = 384  # ... and never less left free after a regrow (a loaded engine leaves ~400 MiB)
 
     def free_vram_mib(self) -> int | None:
         """Free VRAM on the engine's (first) GPU, from NVML (AMD backend: amdgpu's sysfs files, #301); None when it can't
@@ -2253,8 +2261,18 @@ class Service:
             # same FIFO as the requests.
             with self.fifo:
                 try:
-                    encoded = [self.vision.encode(src) for src in images]
+                    # local patch (2026-10-17): encoding is shown (it took 12 s of "Strata idle" after a restart)
+                    with self.status_lock:
+                        self.status.update(pictures=[0, len(images)], pictures_started=time.time())
+                    encoded = []
+                    for src in images:
+                        encoded.append(self.vision.encode(src))
+                        with self.status_lock:
+                            self.status["pictures"] = [len(encoded), len(images)]
                 finally:                                # local patch: a lazy encoder stays up idle_s s for more
+                    with self.status_lock:
+                        self.status.pop("pictures", None)
+                        self.status.pop("pictures_started", None)
                     if getattr(self.vision, "lazy", False):    # pictures (the idle watcher stops it); 0 = stop now
                         self.vision.last_used = time.time()
                         if getattr(self.vision, "idle_s", 0) <= 0 or getattr(self.vision, "fifo", None) is None:
@@ -2586,7 +2604,7 @@ class Service:
             yield "event", ev
         if timings and finish != "cancel" and getattr(self, "miss_watch", None) is not None:
             try:                                # local patch: a continuing conversation must not read again
-                miss = self.miss_watch.check(ids, int(timings.get("cache_n") or 0))
+                miss = self.miss_watch.check(ids, int(timings.get("cache_n") or 0), sampling)
                 if miss:
                     with self.status_lock:
                         self.status["last_miss"] = miss
@@ -2740,6 +2758,8 @@ class CacheMissWatch:
 
     def __init__(self, path):
         self.path, self.recent, self.started = Path(path), collections.deque(maxlen=self.KEEP), time.time()
+        self.meta = collections.deque(maxlen=self.KEEP)    # (system hash, first user message hash) per kept request
+        self.last_read = None
 
     @staticmethod
     def common(a: memoryview, b: memoryview) -> int:
@@ -2755,7 +2775,49 @@ class CacheMissWatch:
                 hi = mid - 1
         return lo
 
-    def check(self, ids, reused: int) -> dict | None:
+    READ_NOTE = 4096   # every request that reads more than this is noted with its reason ("rereads are to be
+                       # noted and justified each") in reads.jsonl beside cache-misses.jsonl
+
+    @staticmethod
+    def hashes(req) -> tuple[str | None, str | None]:
+        """(system prompt + tools, first user message) of a chat request: one conversation keeps its first user message;
+        Qwen Code rebuilds its system prompt when its session process starts (QWEN.md, memory)."""
+        try:
+            msgs = (req or {}).get("messages") or []
+            h = lambda x: hashlib.sha1(json.dumps(x, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:10]
+            system = [m.get("content") for m in msgs if isinstance(m, dict) and m.get("role") in ("system", "developer")]
+            user = next((m.get("content") for m in msgs if isinstance(m, dict) and m.get("role") == "user"), None)
+            return h([system, (req or {}).get("tools")]), (h(user) if user is not None else None)
+        except (AttributeError, TypeError, ValueError):
+            return None, None
+
+    def note(self, ids, reused, best, sys_h, user_h, kind, now) -> None:
+        """Why a request read more than READ_NOTE tokens: a cache miss (none), or its justification."""
+        read = len(ids) - reused
+        if read <= self.READ_NOTE:
+            return
+        same_conv = [e for e in self.meta if e[1] == user_h and user_h is not None]
+        if best - reused > self.SLACK:
+            why = "cache miss"
+        elif kind:
+            why = kind                                           # Qwen's compression: another system prompt, by design
+        elif same_conv and all(e[0] != sys_h for e in same_conv):
+            why = "system prompt changed (the client rebuilt it: e.g. Qwen's session process restarted)"
+        elif not same_conv and now - self.started < 1800 and user_h is not None and len(ids) - best > self.READ_NOTE:
+            why = "first request of this conversation since Strata started (its cache is on disk only if it was parked)"
+        else:
+            why = "new content (no earlier request held these tokens)"
+        rec = {"at": time.strftime("%Y-%m-%d %H:%M:%S"), "prompt": len(ids), "reused": reused, "read": read,
+               "cached_before": best, "why": why}
+        print(f"[strata] read {read:,} of {len(ids):,} tokens: {why}", flush=True)
+        try:
+            with open(self.path.with_name("reads.jsonl"), "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec) + "\n")
+        except OSError:
+            pass
+        self.last_read = {**rec, "t": now}
+
+    def check(self, ids, reused: int, req=None) -> dict | None:
         import array
         cur = memoryview(array.array("i", ids).tobytes())
         best, when = 0, None
@@ -2764,7 +2826,13 @@ class CacheMissWatch:
             if c > best:
                 best, when = c, t
         now = time.time()
+        sys_h, user_h = self.hashes(req)
+        try:
+            self.note(ids, reused, best, sys_h, user_h, request_kind(req), now)
+        except Exception as e:  # noqa: BLE001 -- a note never fails a request
+            print(f"[strata] read note failed: {type(e).__name__}: {e}", flush=True)
         self.recent.append((now, cur))
+        self.meta.append((sys_h, user_h))
         if best - reused <= self.SLACK:
             return None
         miss = {"at": time.strftime("%Y-%m-%d %H:%M:%S"), "t": now, "prompt": len(ids), "reused": reused,
@@ -2802,10 +2870,16 @@ def status_line(svc) -> dict:
     now = time.time()
     q = int(s.get("queued") or 0)
     wait = f" · {q} more waiting" if q else ""
+    if s.get("pictures"):                                   # encoding the request's pictures, before it is read
+        done, total = s["pictures"]
+        el = now - s.get("pictures_started", now)
+        return {"text": f"encoding pictures {done} / {total} \u00b7 {el:.0f} s{wait}", "busy": True,
+                "phase": "encoding pictures", "pictures": [done, total], "elapsed": round(el, 2), "queued": q,
+                "prompt": 0, "read": None, "read_rate": None, "generated": None, "gen_rate": None}
     if not s.get("busy"):
         m = s.get("last_miss")
         miss = {"missed": m["missed"], "age_s": round(now - m["t"])} if m and now - m["t"] < 60 else None
-        return {"text": "Strata idle" + wait, "busy": False, "miss": miss}
+        return {"text": "Strata idle" + wait, "busy": False, "miss": miss, "reread": last_read(svc, now)}
     head = f"{s['kind']}: " if s.get("kind") else ""
     phase, n = s.get("phase") or "busy", int(s.get("prompt_tokens") or 0)
     el = now - s.get("started", now)
@@ -2828,7 +2902,14 @@ def status_line(svc) -> dict:
     m = s.get("last_miss")
     if m and now - m["t"] < CacheMissWatch.MISS_SHOW_S:      # local patch: a miss is shown for a minute
         f["miss"] = {"missed": m["missed"], "age_s": round(now - m["t"])}
+    f["reread"] = last_read(svc, now)
     return {"text": f"{txt} · {el:.0f} s{wait}", **f}
+
+
+def last_read(svc, now):
+    """The latest request that read more than READ_NOTE tokens, and why - for a minute."""
+    r = getattr(getattr(svc, "miss_watch", None), "last_read", None)
+    return {"why": r["why"], "read": r["read"], "age_s": round(now - r["t"])}         if r and now - r["t"] < CacheMissWatch.MISS_SHOW_S else None
 
 
 # ------------------------------------------------------------------------------------------------ live status
