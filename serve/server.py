@@ -1802,6 +1802,7 @@ class Service:
             self.regrow_if_short = regrow_if_short
         self.fit_max_tokens = fit_max_tokens          # --fit-max-tokens: clamp the output cap instead of 400
         self.endpoint_clients = None                  # local patch: None = every client gets end points on disk
+        self.client_cancels = {}                      # local patch: id -> (client ip, cancel, done) per live request
         self.aliases: list[str] = []                  # #297: other names of the model (the config's `aliases`)
         self.sampling_defaults = dict(sampling_defaults or {})   # the run config's `sampling` block
         self.shared = {}                              # the web app's Chat settings for every client (POST /settings)
@@ -2447,6 +2448,12 @@ class Service:
             if not getattr(self.engine, "batch", 0) and isinstance(self.fifo, type(threading.Lock())):
                 try:
                     while not self.fifo.acquire(timeout=2.0):
+                        if cancel is not None and cancel.is_set():   # cancelled while it waited (client gone,
+                            with self.status_lock:                   # or POST /strata/cancel): no turn at all
+                                self.status["queued"] -= 1
+                            yield "done", {"finish": "cancel", "completion_tokens": 0, "reused": 0, "timings": None,
+                                           "reasoning_tokens": 0}
+                            return
                         with self.status_lock:
                             q = {"queue": max(0, int(self.status.get("queued") or 1) - 1),
                                  "busy": bool(self.status.get("busy")), "phase": self.status.get("phase")}
@@ -3289,8 +3296,19 @@ def make_handler(svc: Service):
             request is HTTP/1.0 and fully read here, so no later bytes are expected - data is not a hang-up."""
             done = self.watch_done = threading.Event()
             sock = self.connection
+            # local patch (2026-10-18): every running or queued request by its client, for POST /strata/cancel
+            key = id(cancel)
+            with svc.status_lock:
+                svc.client_cancels[key] = (self.client_address[0], cancel, done)
 
             def watch():
+                try:
+                    _watch()
+                finally:
+                    with svc.status_lock:
+                        svc.client_cancels.pop(key, None)
+
+            def _watch():
                 while not done.wait(0.5) and not cancel.is_set():
                     try:
                         readable, _, _ = select.select([sock], [], [], 0)
@@ -3497,6 +3515,20 @@ def make_handler(svc: Service):
             path = self.path.split("?")[0].rstrip("/")   # issue #55: Claude Code posts /v1/messages?beta=true
             if path.startswith("/v1/") and self._foreign_page():
                 return
+            if path == "/strata/cancel":
+                # local patch (2026-10-18): the coder takes the model now - SubSync's running and queued requests
+                # (POST {"client": "192.168.0.4"}) are cancelled at once, as if their client had hung up
+                try:
+                    req = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0) or 0) or b"{}")
+                except ValueError:
+                    req = {}
+                ip = str(req.get("client") or "")
+                with svc.status_lock:
+                    hits = [c for (a, c, d) in svc.client_cancels.values() if a == ip and not d.is_set() and not c.is_set()]
+                for c in hits:
+                    c.set()
+                print(f"[strata] cancel: {len(hits)} request(s) of {ip or '-'} cancelled", flush=True)
+                return self._json(200, {"cancelled": len(hits), "client": ip})
             if path == "/settings":
                 self._settings()
                 return
