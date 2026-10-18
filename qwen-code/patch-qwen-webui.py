@@ -59,17 +59,34 @@ COMPACT_UI = r"""
   // stream (the page's own /session/<id>/events) tells which tool runs since when: a copy of it is read here and the
   // running tools are kept in window.__lpTools for the status bar (toolCallId -> {sid, name, started}).
   const tools = window.__lpTools = new Map();
+  const done = new Set();                              // finished tool calls (a transcript page may list them first)
   function onEvent(sid, d) {
-    if (d.type === "pending_prompt_completed") {         // the turn is over: nothing of it runs any more
+    if (d.type === "pending_prompt_completed" || d.type === "pending_prompt_added") {   // a turn ends / begins
       for (const [id, x] of tools) if (x.sid === sid) tools.delete(id);
       return;
     }
-    const u = d.type === "session_update" && d.data && d.data.update;
+    const u = (d.type === "session_update" || d.sessionUpdate) && ((d.data && d.data.update) || d.data || d);
     if (!u || (u.sessionUpdate !== "tool_call" && u.sessionUpdate !== "tool_call_update") || !u.toolCallId) return;
     const m = u._meta || {}, had = tools.get(u.toolCallId);
-    if (u.status === "completed" || u.status === "failed") { tools.delete(u.toolCallId); return; }
-    tools.set(u.toolCallId, { sid, name: m.toolName || (had && had.name) || u.kind || "tool",
-                              started: (had && had.started) || m.startedAt || Date.now() });
+    if (u.status === "completed" || u.status === "failed") { tools.delete(u.toolCallId); done.add(u.toolCallId); return; }
+    if (done.has(u.toolCallId)) return;
+    const name = m.toolName && m.toolName !== "tool_call" ? m.toolName : (u.rawInput && u.rawInput.name) || m.toolName;
+    tools.set(u.toolCallId, { sid, name: name || (had && had.name) || u.kind || "tool",
+                              started: (had && had.started) || m.startedAt || m.timestamp || u.timestamp || Date.now() });
+  }
+  // after a page load the page reads the conversation back (GET /session/<id>/transcript) and subscribes to new
+  // events only: a tool already running is found here - a tool_call with no completed/failed update
+  function onTranscript(sid, d) {
+    const evs = (d && d.events) || [];
+    for (const e of evs) {                             // finished ones first, whatever the page's order
+      const u = e && e.data && (e.data.update || e.data);
+      if (u && (u.status === "completed" || u.status === "failed") && u.toolCallId) { done.add(u.toolCallId); tools.delete(u.toolCallId); }
+    }
+    for (const e of evs) {
+      const u = e && e.data && (e.data.update || e.data);
+      if (u && u.sessionUpdate === "tool_call" && Date.now() - (u.timestamp || (u._meta || {}).timestamp || 0) < 6 * 3600e3)
+        onEvent(sid, { type: "session_update", data: { update: u } });
+    }
   }
   async function readEvents(sid, body) {
     const rd = body.pipeThrough(new TextDecoderStream()).getReader();
@@ -96,6 +113,11 @@ COMPACT_UI = r"""
     } catch (e) {}
     const p = nativeFetch.apply(this, arguments);
     const url = typeof r === "string" ? r : (r && (r.url || r.href)) || "";
+    const tr = url.match(/\/session\/([0-9a-f-]{36})\/transcript(\?|$)/);
+    if (tr) return p.then(res => {
+      if (res.ok) res.clone().json().then(d => onTranscript(tr[1], d)).catch(() => {});
+      return res;
+    });
     const ev = url.match(/\/session\/([0-9a-f-]{36})\/events(\?|$)/);
     if (!ev) return p;
     return p.then(res => {
