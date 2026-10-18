@@ -55,13 +55,59 @@ COMPACT_UI = r"""
   let auth = null, panel = null, block = null, input = null, prev = null, shownFor = null, note = null;
   const asked = {};
   const nativeFetch = window.fetch;
+  // 2026-10-18: "model idle" while a shell command runs is true but says too little. The conversation's event
+  // stream (the page's own /session/<id>/events) tells which tool runs since when: a copy of it is read here and the
+  // running tools are kept in window.__lpTools for the status bar (toolCallId -> {sid, name, started}).
+  const tools = window.__lpTools = new Map();
+  function onEvent(sid, d) {
+    if (d.type === "pending_prompt_completed") {         // the turn is over: nothing of it runs any more
+      for (const [id, x] of tools) if (x.sid === sid) tools.delete(id);
+      return;
+    }
+    const u = d.type === "session_update" && d.data && d.data.update;
+    if (!u || (u.sessionUpdate !== "tool_call" && u.sessionUpdate !== "tool_call_update") || !u.toolCallId) return;
+    const m = u._meta || {}, had = tools.get(u.toolCallId);
+    if (u.status === "completed" || u.status === "failed") { tools.delete(u.toolCallId); return; }
+    tools.set(u.toolCallId, { sid, name: m.toolName || (had && had.name) || u.kind || "tool",
+                              started: (had && had.started) || m.startedAt || Date.now() });
+  }
+  async function readEvents(sid, body) {
+    const rd = body.pipeThrough(new TextDecoderStream()).getReader();
+    let buf = "";
+    try {
+      for (;;) {
+        const { value, done } = await rd.read();
+        if (done) break;
+        buf += value;
+        let i;
+        while ((i = buf.indexOf("\n")) >= 0) {
+          const line = buf.slice(0, i).replace(/\r$/, "");
+          buf = buf.slice(i + 1);
+          if (line.startsWith("data:")) try { onEvent(sid, JSON.parse(line.slice(5))); } catch (e) {}
+        }
+      }
+    } catch (e) {}
+  }
   window.fetch = function (r, o) {                    // the page's own requests carry the daemon token: keep it
     try {
       const h = (o && o.headers) || (r instanceof Request ? r.headers : null);
       const a = h && (h instanceof Headers ? h.get("Authorization") : h.Authorization || h.authorization);
       if (a) auth = a;
     } catch (e) {}
-    return nativeFetch.apply(this, arguments);
+    const p = nativeFetch.apply(this, arguments);
+    const url = typeof r === "string" ? r : (r && (r.url || r.href)) || "";
+    const ev = url.match(/\/session\/([0-9a-f-]{36})\/events(\?|$)/);
+    if (!ev) return p;
+    return p.then(res => {
+      if (!res.ok || !res.body) return res;
+      try {
+        const [mine, theirs] = res.body.tee();
+        readEvents(ev[1], mine);
+        const out = new Response(theirs, { status: res.status, statusText: res.statusText, headers: res.headers });
+        Object.defineProperty(out, "url", { value: res.url });
+        return out;
+      } catch (e) { return res; }
+    });
   };
   const hdr = () => Object.assign({ "Content-Type": "application/json" }, auth ? { Authorization: auth } : {});
   const sessionId = () => { const m = location.pathname.match(/\/session\/([0-9a-f-]{36})\/?$/); return m ? m[1] : null; };
@@ -253,7 +299,23 @@ SCRIPT = BEGIN + r"""
       t[0] = "pictures";
       t[1] = st.pictures[0] + " / " + st.pictures[1];
     } else if (!st.busy) {                             // the model does nothing: Qwen runs a tool, or waits
-      t[0] = "model idle"; t[1] = t[2] = t[3] = t[4] = "";
+      // which tool, since when (the compaction script reads them from the conversation's event stream)
+      const sm = location.pathname.match(/\/session\/([0-9a-f-]{36})\/?$/);
+      const run = [...(window.__lpTools || new Map()).values()]
+        .filter(x => sm && x.sid === sm[1] && Date.now() - x.started < 6 * 3600e3).sort((a, b) => a.started - b.started);
+      if (run.length) {
+        const nm = { run_shell_command: "shell", web_fetch: "web fetch", web_search: "web search", agent: "subagent",
+                     read_file: "reading a file", write_file: "writing a file", edit: "editing", grep_search: "searching",
+                     glob: "listing files" }[run[0].name] || run[0].name;
+        const s = Math.max(0, Math.floor((Date.now() - run[0].started) / 1000));
+        t[0] = "waiting: " + nm;
+        t[1] = (s >= 3600 ? Math.floor(s / 3600) + ":" + String(Math.floor(s / 60) % 60).padStart(2, "0")
+                          : Math.floor(s / 60)) + ":" + String(s % 60).padStart(2, "0");
+        t[2] = run.length > 1 ? "+" + (run.length - 1) + " more" : "";
+        t[3] = t[4] = "";
+      } else {
+        t[0] = "model idle"; t[1] = t[2] = t[3] = t[4] = "";
+      }
     } else if (st.generated == null) {                 // reading the prompt
       const read = st.read == null ? null
         : Math.min(st.prompt, st.read + (st.read_rate || 0) * ((st.read_age || 0) + dt));
