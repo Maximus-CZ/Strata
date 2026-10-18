@@ -5216,6 +5216,9 @@ int main(int argc, char** argv) {
         }
         // Save only on a switch/rewind, not on each continuing request. No graph
         // addresses change: all parked images live in ordinary host vectors.
+        // local patch (2026-10-18): endpoint=0 on a request - its conversation's end point is never written to disk
+        // (SubSync's agents: short-lived, 38 GB of end points in a night; their shared system prompts still are)
+        bool live_endpoint = true;
         auto park_current = [&](size_t held) -> bool {
             if (!conversations.enabled() || !live_ok || live.empty()) return true;
             // local patch (2026-10-15, conversation end points on disk): the outgoing conversation's end point - its
@@ -5236,7 +5239,8 @@ int main(int argc, char** argv) {
                 // user...) is worth a file - a first turn is usually a one-off (a SubSync verifier or whole-file
                 // question, a web_fetch summary: 13 x 855 MB in 3 min flushed the store); and a tail under 2048 tokens
                 // is read again in ~3 s, cheaper than writing and restoring 130+ MB
-                const char* why = !best ? "no checkpoint" : root_at <= 0 ? "no turn boundary"
+                const char* why = !live_endpoint ? "the client asked for none (endpoint=0)"
+                                : !best ? "no checkpoint" : root_at <= 0 ? "no turn boundary"
                                 : turns < 4 ? "a first turn (saved once the conversation comes back)"
                                 : n_tail - root_at < 2048 ? "under 2048 tokens past the system prompt"
                                 : prefixes.contains(best->ids, best->imgs, cvec_cached) ? "already saved" : nullptr;
@@ -6327,6 +6331,7 @@ int main(int argc, char** argv) {
             float req_min_p = 0.0f, req_penalty_repeat = 1.0f, req_penalty_freq = 0.0f, req_penalty_present = 0.0f;
             int req_penalty_last_n = 0;
             int req_cvec = 1;   // cvec=0|1: a loaded control vector for this request (on when absent)
+            bool req_endpoint = true;   // endpoint=0|1: its end point to disk when it is parked
             // tuning keys (setup's calibration measures settings without restarting the engine): the PCIe share of
             // the missed experts and the draft-probability floor, for this request only
             double req_pcie_frac = o.pcie_frac, req_spec_min_p = o.spec_min_p;
@@ -6343,6 +6348,7 @@ int main(int argc, char** argv) {
                     const std::string key = tok.substr(0, eq);
                     const float fv = std::strtof(tok.c_str() + eq + 1, nullptr);
                     if (key == "cvec") req_cvec = std::atoi(tok.c_str() + eq + 1);
+                    else if (key == "endpoint") req_endpoint = std::atoi(tok.c_str() + eq + 1) != 0;
                     else if (key == "temperature") req_temperature = fv;
                     else if (key == "top_p") req_top_p = fv;
                     else if (key == "top_k") req_top_k = std::atoi(tok.c_str() + eq + 1);
@@ -6580,6 +6586,7 @@ int main(int argc, char** argv) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
+            live_endpoint = req_endpoint;   // the outgoing conversation was parked with its own flag; now this one's
             if (slot_source >= 0) {
                 const auto t0 = Clock::now();
                 if (!copy_from_slot(slot_source, slot_ck, err)) {

@@ -690,6 +690,8 @@ class StrataEngine:
         seed = sampling.get("seed")
         if isinstance(seed, int) and seed > 0:
             keys += f" seed={seed}"
+        if sampling.get("_strata_endpoint") is False:   # local patch: no end point to disk for this conversation
+            keys += " endpoint=0"
         # setup's calibration (tools/calibrate.py): engine settings for this request only, measured without a restart
         tune = sampling.get("strata_tune")
         if isinstance(tune, dict):
@@ -1799,6 +1801,7 @@ class Service:
                     print(f"[strata] regrow failed: {type(e).__name__}: {e}", flush=True)
             self.regrow_if_short = regrow_if_short
         self.fit_max_tokens = fit_max_tokens          # --fit-max-tokens: clamp the output cap instead of 400
+        self.endpoint_clients = None                  # local patch: None = every client gets end points on disk
         self.aliases: list[str] = []                  # #297: other names of the model (the config's `aliases`)
         self.sampling_defaults = dict(sampling_defaults or {})   # the run config's `sampling` block
         self.shared = {}                              # the web app's Chat settings for every client (POST /settings)
@@ -3772,6 +3775,11 @@ def make_handler(svc: Service):
 
         def _openai(self, req):
             req = svc.with_shared(req, "openai")
+            # local patch (2026-10-18): only the clients in the config's "endpoint_clients" (default: all) get their
+            # conversations' end points written to disk; the others keep their shared system prompts only (SubSync's
+            # agents wrote 38 GB of end points in a night and evicted Qwen's conversation)
+            if svc.endpoint_clients is not None and self.client_address[0] not in svc.endpoint_clients:
+                req = {**req, "_strata_endpoint": False}
             messages, tools, kw = openai_to_messages(req)
             messages, validator = prepare_format(req.get("response_format"), messages)
             if validator is not None and (tools or req.get("strata_mcp")):
@@ -4428,6 +4436,10 @@ def main() -> int:
                   model_name=cfg.get("model_name", "qwen3.8-flash-next"), vision=vision,
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)
+    ec = cfg.get("endpoint_clients")                    # local patch: who gets conversation end points on disk
+    svc.endpoint_clients = set(ec) if isinstance(ec, list) else None
+    if svc.endpoint_clients is not None:
+        print(f"[strata] conversation end points on disk only for {', '.join(sorted(svc.endpoint_clients))}", flush=True)
     try:
         svc.set_aliases(cfg.get("aliases"))             # #297: other names the model answers to
     except ValueError as e:
