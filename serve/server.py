@@ -2856,12 +2856,13 @@ class CacheMissWatch:
         if read <= self.READ_NOTE:
             return
         same_conv = [e for e in self.meta if e[1] == user_h and user_h is not None]
-        if best - reused > self.SLACK:
-            why = "cache miss"
-        elif kind:
+        if kind:
             why = kind                                           # Qwen's compression: another system prompt, by design
         elif same_conv and all(e[0] != sys_h for e in same_conv):
-            why = "system prompt changed (the client rebuilt it: e.g. Qwen's session process restarted)"
+            why = ("system prompt or tool list changed (the client rebuilt it: Qwen's session process restarted, "
+                   "or a tool came or went - the proxy log names it)")
+        elif best - reused > self.SLACK:
+            why = "cache miss"
         elif not same_conv and now - self.started < 1800 and user_h is not None and len(ids) - best > self.READ_NOTE:
             why = "first request of this conversation since Strata started (its cache is on disk only if it was parked)"
         else:
