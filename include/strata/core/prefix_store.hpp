@@ -21,6 +21,7 @@ public:
         std::string identity;   // engine build and model; a file with another one is deleted
         size_t ram_budget = 0, disk_budget = 0, min_free = 0;
         size_t bounce = 64u << 20;
+        size_t family_tokens = 1024;   // local patch: snapshots sharing this many first tokens are one family
     };
     struct Match {
         uint64_t key = 0;
@@ -81,6 +82,7 @@ private:
         // local patch (delta end points): bytes [0, from[j][i]) of layer j's payload i are the parent's; the
         // file holds the rest, layer by layer, payload by payload, from file offset data_at on
         uint64_t parent = 0, shape = 0, data_at = 0;
+        uint64_t family = 0;   // local patch: its first kFamilyTokens tokens - one client and system prompt
         std::vector<ConversationKvSizes> sizes, from;
     };
     std::string path(uint64_t key) const;

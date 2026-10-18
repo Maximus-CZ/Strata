@@ -301,6 +301,31 @@ void prefix_session(int fmt, int mode, const std::string& dir) {
               "siblings: the fourth is a delta on the root, not on a sibling or whole");
         fill(241);
         std::vector<int32_t> next=s4.ids; next.push_back(9);
+        // local patch (2026-10-18): the store evicts the least recently used snapshot of the LARGEST family first
+        {
+            PrefixStore::Options f=d; f.family_tokens=8;
+            const std::string fdir=dir+"_family"; fs::remove_all(fdir); f.dir=fdir;
+            PrefixStore fam;
+            check(fam.open(f,log,err),"family: open");
+            auto point=[&](int32_t first,int64_t L) {   // a snapshot whose first 8 tokens are first..first+7
+                ConversationCheckpoint c; c.ids.resize((size_t)L);
+                for (int64_t i=0;i<L;++i) c.ids[(size_t)i]=first+(int32_t)i;
+                check(conversation_checkpoint_save(c,ss,g,err) && fam.capture(c,true,ss,g,draft.state,log,err),"family: save");
+                return c;
+            };
+            fill(250);
+            auto old_b=point(5000,30);                  // family B: one snapshot, the oldest of all
+            point(100,30); point(100,34); point(100,38); // family A: three, newer
+            const size_t one=fam.disk_bytes()/4;
+            f.disk_budget=fam.disk_bytes()+one/2;        // room for one more only after an eviction
+            PrefixStore tight; check(tight.open(f,log,err) && tight.size()==4,"family: reopen with a tight budget");
+            fill(251);
+            ConversationCheckpoint c; c.ids.resize(42); for (int i=0;i<42;++i) c.ids[(size_t)i]=100+i;
+            check(conversation_checkpoint_save(c,ss,g,err) && tight.capture(c,true,ss,g,draft.state,log,err),"family: A grows");
+            check(tight.contains(old_b.ids,{},true),"family: the oldest snapshot of the small family stays");
+            check(tight.size()<=4,"family: one of the large family's went instead");
+            fs::remove_all(fdir);
+        }
         check(again.best(next,{},true).tokens==(int64_t)s4.ids.size() &&
               again.restore(again.best(next,{},true).key,ss,g,draft.state,source,err)==ConversationRestore::restored &&
               restored(q4),"siblings: and it restores exactly");

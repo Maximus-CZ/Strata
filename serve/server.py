@@ -1275,10 +1275,20 @@ class Vision:
             args += ["--threads", str(cfg["threads"])]
         if cfg.get("max_tokens"):
             args += ["--max-tokens", str(cfg["max_tokens"])]
-        self.dir = Path(tempfile.mkdtemp(prefix="strata-vision-"))
         self.spawn = (args, log, env)                   # to start it again after an unload
         self.lock = threading.Lock()
         self.cache: dict[str, tuple[Path, int]] = {}
+        # local patch (2026-10-18): "cache_dir" keeps encoded pictures across restarts (a temp folder each start made
+        # every restart re-encode a conversation's pictures). Bound to the encoder files and settings: another
+        # mmproj, model or max_tokens empties it. Without cache_dir: a temp folder, as before.
+        self.dir = None
+        if cfg.get("cache_dir"):
+            try:
+                self.dir = self._persistent(Path(cfg["cache_dir"]), args)
+            except OSError as e:
+                print(f"[strata] vision: cache_dir {cfg['cache_dir']} unusable ({e}); a temp folder instead", flush=True)
+        if self.dir is None:
+            self.dir = Path(tempfile.mkdtemp(prefix="strata-vision-"))
         # local patch: "lazy": true - a GPU encoder that is not resident.  It starts only for a picture that is not
         # cached yet, after before_start(vram_mib) made the engine give that VRAM back (--vram-elastic), and stops
         # right after the request's pictures are encoded; after_stop() lets the engine take its VRAM back.  Its
@@ -1330,6 +1340,29 @@ class Vision:
 
     def alive(self) -> bool:
         return not self.stopped and self.proc is not None and self.proc.poll() is None
+
+    KEEP = 256   # encoded pictures kept on disk (cache_dir), the newest
+
+    def _persistent(self, d: Path, args) -> Path:
+        d.mkdir(parents=True, exist_ok=True)
+        ident = json.dumps([[a, os.path.getsize(a), int(os.path.getmtime(a))] if os.path.isfile(a) else a for a in args])
+        idf = d / "identity.json"
+        if not idf.exists() or idf.read_text(encoding="utf-8") != ident:
+            for f in list(d.glob("*.sve")) + list(d.glob("*.n")) + list(d.glob("*.img")):
+                f.unlink(missing_ok=True)
+            idf.write_text(ident, encoding="utf-8")
+        sves = sorted(d.glob("*.sve"), key=lambda f: f.stat().st_mtime)
+        for f in sves[:-self.KEEP]:                     # the oldest beyond KEEP
+            f.unlink(missing_ok=True)
+            f.with_suffix(".n").unlink(missing_ok=True)
+        for f in sves[-self.KEEP:]:
+            n = f.with_suffix(".n")
+            try:
+                self.cache[f.stem] = (f, int(n.read_text()))
+            except (OSError, ValueError):
+                f.unlink(missing_ok=True)
+        print(f"[strata] vision: {len(self.cache)} encoded pictures kept in {d}", flush=True)
+        return d
 
     def release(self):
         """local patch: a lazy encoder stops after a request's pictures and the engine takes its VRAM back."""
@@ -1423,9 +1456,15 @@ class Vision:
                 raise ValueError("the image could not be read: " + (line[4:] if line.startswith("ERR") else
                                                                      "the vision encoder stopped"))
             self.cache[key] = (out, int(line.split()[1]))
-            if len(self.cache) > 64:                                   # oldest first
+            try:                                                       # local patch: the token count beside it
+                out.with_suffix(".n").write_text(line.split()[1])
+            except OSError:
+                pass
+            if len(self.cache) > self.KEEP:                            # oldest first
                 old = next(iter(self.cache))
-                self.cache.pop(old)[0].unlink(missing_ok=True)
+                f = self.cache.pop(old)[0]
+                f.unlink(missing_ok=True)
+                f.with_suffix(".n").unlink(missing_ok=True)
             return self.cache[key]
 
     def close(self):

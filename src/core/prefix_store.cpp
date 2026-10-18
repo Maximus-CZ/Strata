@@ -22,6 +22,14 @@ using Clock = std::chrono::steady_clock;
 // | K/V payloads past their delta starts (conversation_kv_layout order)
 constexpr char kMagic[8] = {'S', 'T', 'R', 'P', 'F', 'X', '0', '3'};   // 02: + picture keys, 03: + deltas 
 constexpr size_t kMaxDepth = 24;        // a longer chain is saved whole again
+// snapshots that share their first Options::family_tokens tokens are one family (eviction: the largest first)
+uint64_t family_of(const std::vector<int32_t>& ids, size_t tokens) {
+    uint64_t h = 1469598103934665603ull;
+    const size_t n = std::min(ids.size(), tokens);
+    for (size_t i = 0; i < n; ++i)
+        for (int b = 0; b < 4; ++b) { h ^= (uint8_t) ((uint32_t) ids[i] >> (8 * b)); h *= 1099511628211ull; }
+    return h;
+}
 constexpr size_t kSample = 4096;        // bytes per sampled comparison with the base
 constexpr size_t kSamples = 8;          // sampled places per payload
 
@@ -263,10 +271,24 @@ size_t PrefixStore::disk_bytes() const {
 }
 
 // least recently used first, until `incoming` more fits the budget
+// local patch (2026-10-18): the least recently used snapshot OF THE LARGEST FAMILY first, not the oldest of all - a
+// night of SubSync (38 GB of its agents' end points in 5 h) evicted the Qwen conversation the user came back to in the
+// morning. One client now evicts its own snapshots before it touches another's.
 void PrefixStore::trim_disk(size_t incoming) {
-    while (!entries_.empty() && disk_bytes() + incoming > o_.disk_budget)
-        erase(std::min_element(entries_.begin(), entries_.end(),
-                               [](const Entry& a, const Entry& b) { return a.used < b.used; })->key);
+    while (!entries_.empty() && disk_bytes() + incoming > o_.disk_budget) {
+        std::vector<std::pair<uint64_t, size_t>> fam;   // (family, bytes)
+        for (const auto& e : entries_) {
+            auto it = std::find_if(fam.begin(), fam.end(), [&](const auto& f) { return f.first == e.family; });
+            if (it == fam.end()) fam.push_back({e.family, e.file_bytes});
+            else it->second += e.file_bytes;
+        }
+        const uint64_t big = std::max_element(fam.begin(), fam.end(),
+                                              [](const auto& a, const auto& b) { return a.second < b.second; })->first;
+        const Entry* victim = nullptr;
+        for (const auto& e : entries_)
+            if (e.family == big && (!victim || e.used < victim->used)) victim = &e;
+        erase(victim->key);
+    }
 }
 
 bool PrefixStore::trim_ram(size_t incoming) {
@@ -309,6 +331,7 @@ bool PrefixStore::open(const Options& options, std::string& log, std::string& er
             if (ok) { e.data_at = tell(r.f); e.shape = shape_of(m); }
         }
         e.key = key_of(e.ids, e.imgs, e.cvec);
+        e.family = family_of(e.ids, o_.family_tokens);
         if (!ok || p.filename().string() != fs::path(path(e.key)).filename().string()) {
             fs::remove(p, ec);
             ++dropped;
@@ -505,6 +528,7 @@ bool PrefixStore::capture(const ConversationCheckpoint& root, bool cvec, const S
     e.file_bytes = (size_t) fs::file_size(final_path, ec);
     e.used = ++clock_;
     e.parent = parent;
+    e.family = family_of(e.ids, o_.family_tokens);
     e.shape = shape;
     e.data_at = data_at;
     e.sizes = std::move(sizes);
