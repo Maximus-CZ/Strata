@@ -14,6 +14,8 @@ Also (2026-10-18): the choice between a conversation's uncompacted and compacted
 compacted one while the user is away), through the daemon route /lp-compact/* that this patches in.
 
 And (2026-10-18): side tasks / branches / forks in every trusted workspace, not only the daemon's primary one.
+And (2026-10-18, core): propose_goal always declared - a Goal starting or ending no longer changes the tool list
+(which made Strata re-read the whole conversation).
 
 Lives in C:/Strata/qwen-code (branch patched, beside the Strata patches); C:/Users/user/bin/patch-qwen-webui.py runs it.
 A Qwen Code update replaces index.html and the daemon: run this again (idempotent), then restart the web UI.
@@ -430,8 +432,46 @@ def patch_daemon(remove=False):
     return False
 
 
+# Patches of Qwen Code's core (the session processes, `cli.js --acp`; a chunk found by its code, as names change).
+# 2026-10-18: a side task re-read 224K tokens because its tool list changed - propose_goal is declared to the model
+# only while the turn may propose a Goal, so it vanished when the Goal started (20:11, 20 -> 19 tools) and came back
+# when it ended (21:00, 19 -> 20); the tool definitions sit at the start of the prompt, so either way Strata had to read
+# the whole conversation again. Now it is declared always (when registered at all - goals.modelProposed "disabled"
+# still removes it): a call from a turn that may not propose is refused by Qwen Code itself ("The Goal was not set:
+# this turn cannot own a Goal approval ...").
+CORE_PATCHES = [("propose_goal always declared (a stable tool list for the prompt cache)",
+                 'return name!==ToolNames.PROPOSE_GOAL||this.config.isGoalProposalAvailable()}',
+                 'return true/*lp-stable-tools: name!==ToolNames.PROPOSE_GOAL||this.config.isGoalProposalAvailable()*/}')]
+
+
+def patch_core(remove=False):
+    for what, old, new in CORE_PATCHES:
+        hit = False
+        for name in os.listdir(DAEMON_DIR):
+            if not name.endswith(".js") or name.startswith("server-"):
+                continue
+            path = os.path.join(DAEMON_DIR, name)
+            with open(path, encoding="utf-8") as f:
+                js = f.read()
+            a, b = (new, old) if remove else (old, new)
+            if b in js and a not in js:
+                print(f"core: {what}: already " + ("removed" if remove else "patched"))
+                hit = True
+                break
+            if a in js:
+                with open(path, "w", encoding="utf-8", newline="") as f:
+                    f.write(js.replace(a, b))
+                print(f"core {'unpatched' if remove else 'patched'} ({what}): {path} - new session processes load it "
+                      "(restart qwen serve when Qwen is idle)")
+                hit = True
+                break
+        if not hit:
+            print(f"core: {what}: the code moved (check by hand)")
+
+
 def main():
     patch_daemon("--remove" in sys.argv)
+    patch_core("--remove" in sys.argv)
     with open(INDEX, encoding="utf-8") as f:
         html = f.read()
     if BEGIN in html:
