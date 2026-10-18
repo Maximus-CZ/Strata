@@ -176,6 +176,18 @@ COMPACT_UI = r"""
   }
   setInterval(check, 500);
   setInterval(place, 250);
+  // 2026-10-18: Windows idle-slept the PC (19:59) while he used this page remotely - no input at the PC itself.
+  // While the page is visible and was touched in the last 10 min it says so once a minute; the compactor then keeps
+  // the PC awake 5 min more. A tab left open (hidden, or untouched) says nothing, so the PC still sleeps.
+  let touched = Date.now(), told = 0;
+  function awake() {
+    if (document.visibilityState !== "visible" || Date.now() - touched > 600000) return;
+    told = Date.now();
+    nativeFetch("/lp-compact/awake", { method: "POST", headers: hdr(), body: "{}" }).catch(() => {});
+  }
+  for (const ev of ["pointerdown", "keydown", "wheel", "touchstart"])
+    addEventListener(ev, () => { touched = Date.now(); if (touched - told > 60000) awake(); }, { capture: true, passive: true });
+  setInterval(awake, 60000);
 })();
 </script>
 """
