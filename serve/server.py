@@ -2920,11 +2920,15 @@ def request_kind(req) -> str | None:
     """local patch (2026-10-16): what a request is, for /status - Qwen Code's history compression has a system prompt
     of its own (it asks for a <state_snapshot>), so the cache cannot help it and it reads the whole conversation."""
     try:
-        system = " ".join(str(m.get("content") or "") for m in (req or {}).get("messages") or []
-                          if isinstance(m, dict) and m.get("role") in ("system", "developer"))
-    except AttributeError:
+        msgs = [m for m in (req or {}).get("messages") or [] if isinstance(m, dict)]
+        system = " ".join(str(m.get("content") or "") for m in msgs if m.get("role") in ("system", "developer"))
+        # 2026-10-19: Qwen's "cache sharing" compression keeps the conversation's own system prompt and asks for the
+        # <state_snapshot> in the last user message - shown as "answering" until this looked there too
+        last = next((m for m in reversed(msgs) if m.get("role") == "user"), None)
+        tail = json.dumps(last.get("content"), ensure_ascii=False)[-4000:] if last else ""
+    except (AttributeError, TypeError, ValueError):
         return None
-    return "compressing the conversation" if "<state_snapshot>" in system else None
+    return "compressing the conversation" if "<state_snapshot>" in system or "<state_snapshot>" in tail else None
 
 
 def status_line(svc) -> dict:
