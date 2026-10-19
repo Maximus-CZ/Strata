@@ -33,28 +33,28 @@ BEGIN, END = "<!-- strata-status: begin (C:\\Users\\user\\bin\\patch-qwen-webui.
 # reloads the conversation from its new start). The page's own requests carry the daemon token; it is reused here.
 COMPACT_UI = r"""
 <style>
+  /* sits exactly on the message box (locked meanwhile) - the conversation above stays fully visible */
   #lp-compact { --pc-bg: #fff; --pc-fg: #1b1b1f; --pc-btn: #f3f3f6; --pc-line: #d4d4dc; --pc-pie: #e2e2ea; --pc-acc: #2f7de1;
-    position: fixed; z-index: 2147483000; box-sizing: border-box; padding: 14px; border-radius: 12px;
-    background: var(--pc-bg); color: var(--pc-fg); box-shadow: 0 8px 32px rgba(0,0,0,.35); font: 14px/1.4 system-ui, sans-serif; }
+    position: fixed; z-index: 2147483000; box-sizing: border-box; padding: 6px 8px; border-radius: 12px;
+    display: flex; flex-direction: column; justify-content: center; gap: 5px;
+    background: var(--pc-bg); color: var(--pc-fg); border: 1px solid var(--pc-line); font: 13px/1.3 system-ui, sans-serif; }
   @media (prefers-color-scheme: dark) {
     #lp-compact { --pc-bg: #24242b; --pc-fg: #ececf1; --pc-btn: #2f2f38; --pc-line: #474752; --pc-pie: #3b3b46; --pc-acc: #5aa2ff; } }
-  #lp-compact .pc-title { font-weight: 600; margin: 0 2px 10px; }
-  #lp-compact .pc-row { display: flex; flex-wrap: wrap; gap: 12px; }
-  #lp-compact button.pc { flex: 1 1 240px; min-height: 140px; display: flex; align-items: center; gap: 16px; padding: 14px 18px;
-    border: 2px solid var(--pc-line); border-radius: 10px; background: var(--pc-btn); color: inherit; font: inherit;
-    font-size: 15px; text-align: left; cursor: pointer; }
+  #lp-compact .pc-title { font-size: 12px; opacity: .8; margin: 0 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #lp-compact .pc-row { display: flex; gap: 8px; }
+  #lp-compact button.pc { flex: 1 1 0; min-width: 0; display: flex; align-items: center; gap: 10px; padding: 6px 10px;
+    border: 2px solid var(--pc-line); border-radius: 9px; background: var(--pc-btn); color: inherit; font: inherit;
+    text-align: left; cursor: pointer; }
   #lp-compact button.pc:hover:not(:disabled) { border-color: var(--pc-acc); }
   #lp-compact button.pc:disabled { opacity: .6; cursor: progress; }
-  #lp-compact button.pc b { font-size: 19px; }
+  #lp-compact button.pc b { font-size: 15px; }
+  #lp-compact button.pc span { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
   #lp-compact button.pc small { opacity: .75; }
   #lp-compact svg { flex: none; }
-  #lp-compact .pc-note { margin: 10px 2px 0; font-size: 12.5px; opacity: .75; }
-  #lp-compact-block { position: fixed; z-index: 2147482999; background: rgba(128,128,128,.28); border-radius: 10px;
-    cursor: not-allowed; }
 </style>
 <script>
 (() => {
-  let auth = null, panel = null, block = null, input = null, prev = null, shownFor = null, note = null;
+  let auth = null, panel = null, input = null, prev = null, shownFor = null, note = null;
   const asked = {};
   const nativeFetch = window.fetch;
   // 2026-10-18: "model idle" while a shell command runs is true but says too little. The conversation's event
@@ -165,15 +165,14 @@ COMPACT_UI = r"""
   function pie(frac) {
     const f = Math.max(0, Math.min(1, frac || 0)), R = 15.9155;      // circumference 100
     const col = f > 0.8 ? "#e5484d" : f > 0.5 ? "#e8a33d" : "var(--pc-acc)";
-    return '<svg viewBox="0 0 36 36" width="92" height="92" aria-hidden="true">' +
+    return '<svg viewBox="0 0 36 36" width="44" height="44" aria-hidden="true">' +
       `<circle cx="18" cy="18" r="${R}" fill="none" stroke="var(--pc-pie)" stroke-width="6.5"/>` +
       `<circle cx="18" cy="18" r="${R}" fill="none" stroke="${col}" stroke-width="6.5" stroke-dasharray="${(f * 100).toFixed(2)} 100" transform="rotate(-90 18 18)"/>` +
       `<text x="18" y="20.6" text-anchor="middle" font-size="7.5" font-weight="600" fill="currentColor">${Math.round(f * 100)}%</text></svg>`;
   }
   function close() {
     if (panel) panel.remove();
-    if (block) block.remove();
-    panel = block = note = null;
+    panel = note = null;
     lock(false);
     if (shownFor) delete asked[shownFor];             // not picked: asked again when it is opened again
     shownFor = null;
@@ -188,13 +187,14 @@ COMPACT_UI = r"""
       if (p.height > 280 || p.width > innerWidth) break;
       b = b.parentElement; r = p;
     }
-    const w = Math.min(innerWidth - 16, Math.max(320, r ? r.width : innerWidth - 32));
+    // exactly over the message box's card (it takes nothing meanwhile); only a card too low for the buttons makes
+    // the panel reach up a little - bottom edges aligned
+    const w = Math.min(innerWidth - 16, Math.max(300, r ? r.width : innerWidth - 32));
     const left = Math.max(8, Math.min(innerWidth - w - 8, r ? r.left : 16));
     panel.style.width = w + "px";
     panel.style.left = left + "px";
-    panel.style.bottom = (r ? Math.max(8, innerHeight - r.top + 10) : 16) + "px";
-    if (r) Object.assign(block.style, { display: "", left: r.left + "px", top: r.top + "px", width: r.width + "px", height: r.height + "px" });
-    else block.style.display = "none";
+    panel.style.bottom = (r ? Math.max(0, innerHeight - r.bottom) : 16) + "px";
+    panel.style.minHeight = (r ? Math.max(r.height, 84) : 84) + "px";
   }
   function open(sid, o) {
     close();
@@ -203,17 +203,15 @@ COMPACT_UI = r"""
     panel = document.createElement("div");
     panel.id = "lp-compact";
     panel.innerHTML =
-      '<div class="pc-title">This conversation was compacted while you were away. Continue with:</div><div class="pc-row">' +
+      `<div class="pc-title" title="The other branch is thrown away. Compacted ${made.toLocaleString()} ` +
+      `(took ${Math.round(o.took_s / 60)} min).">Compacted while you were away - continue with ` +
+      `(the other one is thrown away):</div><div class="pc-row">` +
       `<button class="pc" data-c="uncompacted">${pie(o.uncompacted.tokens / win)}<span><b>Uncompacted</b><br>` +
-      `${fmt(o.uncompacted.tokens)} tokens<br><small>everything word for word</small></span></button>` +
+      `<small>${fmt(o.uncompacted.tokens)} tokens, word for word</small></span></button>` +
       `<button class="pc" data-c="compacted">${pie(o.compacted.tokens / win)}<span><b>Compacted</b><br>` +
-      `~${fmt(o.compacted.tokens)} tokens<br><small>a summary + the latest turns; room for more</small></span></button></div>` +
-      `<div class="pc-note">The other branch is thrown away. Compacted ${made.toLocaleString()} (took ${Math.round(o.took_s / 60)} min).</div>`;
-    note = panel.querySelector(".pc-note");
-    block = document.createElement("div");
-    block.id = "lp-compact-block";
-    block.title = "Pick a branch first";
-    document.body.append(block, panel);
+      `<small>~${fmt(o.compacted.tokens)} tokens, summary + latest turns</small></span></button></div>`;
+    note = panel.querySelector(".pc-title");
+    document.body.append(panel);
     const btns = [...panel.querySelectorAll("button.pc")];
     btns.forEach(b => b.addEventListener("click", () => choose(sid, b.dataset.c, btns)));
     place();
