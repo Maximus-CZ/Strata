@@ -61,6 +61,10 @@ COMPACT_UI = r"""
   // stream (the page's own /session/<id>/events) tells which tool runs since when: a copy of it is read here and the
   // running tools are kept in window.__lpTools for the status bar (toolCallId -> {sid, name, started}).
   const tools = window.__lpTools = new Map();
+  // 2026-10-20: after "compacted" Qwen's own context pie kept the old size until the next reply - it takes the
+  // last usage seen in the conversation's events. The reopened conversation's stream starts with one usage update of
+  // the compacted size (counted exactly by the compactor); the next real reply replaces it.
+  const pendingUsage = {};
   const done = new Set();                              // finished tool calls (a transcript page may list them first)
   function onEvent(sid, d) {
     if (d.type === "pending_prompt_completed" || d.type === "pending_prompt_added") {   // a turn ends / begins
@@ -127,7 +131,20 @@ COMPACT_UI = r"""
       try {
         const [mine, theirs] = res.body.tee();
         readEvents(ev[1], mine);
-        const out = new Response(theirs, { status: res.status, statusText: res.statusText, headers: res.headers });
+        let body = theirs;
+        const n = pendingUsage[ev[1]];
+        if (n) {                                       // just switched to the compacted branch: see reopen()
+          delete pendingUsage[ev[1]];
+          const first = new TextEncoder().encode("event: session_update\ndata: " + JSON.stringify({ type: "session_update",
+            data: { sessionId: ev[1], update: { sessionUpdate: "usage_update", _meta: { usage: { inputTokens: n, totalTokens: n } } } } }) + "\n\n");
+          const rd = theirs.getReader();
+          body = new ReadableStream({
+            start(c) { c.enqueue(first); },
+            async pull(c) { const { value, done } = await rd.read(); if (done) c.close(); else c.enqueue(value); },
+            cancel(r) { return rd.cancel(r); }
+          });
+        }
+        const out = new Response(body, { status: res.status, statusText: res.statusText, headers: res.headers });
         Object.defineProperty(out, "url", { value: res.url });
         return out;
       } catch (e) { return res; }
@@ -224,11 +241,28 @@ COMPACT_UI = r"""
       const d = await r.json().catch(() => ({}));
       if (r.status === 404 || r.status === 409) { shownFor = null; close(); asked[sid] = Date.now(); return; }
       if (!r.ok) throw new Error(d.error || "HTTP " + r.status);
-      if (c === "compacted") { location.reload(); return; }
       shownFor = null; close(); asked[sid] = Date.now();
+      if (c === "compacted") { if (d.tokens) pendingUsage[sid] = d.tokens; reopen(sid); }
     } catch (e) {
       note.textContent = "That failed (" + e.message + "); nothing was changed - try again.";
       btns.forEach(b => b.disabled = false);
+    }
+  }
+  // 2026-10-20: a page reload after "compacted" landed on the start page (the conversation had to be clicked
+  // again). The daemon has the conversation loaded again by now; the app is sent to the start page and back by its
+  // own router (popstate), so it opens the conversation fresh - the compacted history and its context pie - with no
+  // reload. If the app does not come back to it, the address is opened the ordinary way.
+  function reopen(sid) {
+    const url = location.pathname + location.search + location.hash;
+    const go = (to) => { history.replaceState(history.state, "", to); dispatchEvent(new PopStateEvent("popstate", { state: history.state })); };
+    try {
+      go("/");
+      setTimeout(() => {
+        go(url);
+        setTimeout(() => { if (sessionId() !== sid) location.assign(url); }, 2500);
+      }, 400);
+    } catch (e) {
+      location.assign(url);
     }
   }
   async function check() {
