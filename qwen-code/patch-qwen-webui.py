@@ -276,6 +276,33 @@ COMPACT_UI = r"""
       if (o && o.offer && sessionId() === sid) open(sid, o);
     } catch (e) {}
   }
+  // 2026-10-20: Diff and Download failed with "NetworkError" - the Authentik sign-in (24 h) had run out, every new
+  // request was redirected to the login, which the browser blocks for scripts. Once a minute this asks whether the
+  // sign-in still holds (a redirect instead of an answer = no) and says so at the top, with a reload that signs in.
+  let expired = null;
+  async function signin() {
+    if (location.hostname === "localhost" || location.hostname === "127.0.0.1" || /^192\.168\./.test(location.hostname)) return;
+    let gone = false;
+    try {
+      const r = await nativeFetch("/lp-compact/status", { headers: hdr(), cache: "no-store", redirect: "manual" });
+      gone = r.type === "opaqueredirect" || (r.status >= 300 && r.status < 400);
+    } catch (e) { return; }                            // offline, the PC asleep: not this
+    if (gone && !expired) {
+      expired = document.createElement("div");
+      expired.setAttribute("style", "position:fixed;top:8px;left:50%;transform:translateX(-50%);z-index:2147483001;" +
+        "background:#7a2e2e;color:#fff;padding:8px 14px;border-radius:9px;font:13px system-ui,sans-serif;" +
+        "box-shadow:0 4px 16px rgba(0,0,0,.35);display:flex;gap:12px;align-items:center;max-width:calc(100vw - 32px)");
+      expired.innerHTML = "<span>Your sign-in expired - Diff, Download and new requests fail until you sign in again.</span>";
+      const b = document.createElement("button");
+      b.textContent = "Reload and sign in";
+      b.setAttribute("style", "background:#fff;color:#7a2e2e;border:0;border-radius:6px;padding:4px 10px;font:inherit;cursor:pointer");
+      b.onclick = () => location.reload();
+      expired.appendChild(b);
+      document.body.appendChild(expired);
+    } else if (!gone && expired) { expired.remove(); expired = null; }
+  }
+  setInterval(signin, 60000);
+  setTimeout(signin, 5000);
   setInterval(check, 500);
   setInterval(place, 250);
   // 2026-10-18: Windows idle-slept the PC (19:59) while he used this page remotely - no input at the PC itself.
