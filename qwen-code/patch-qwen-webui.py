@@ -431,12 +431,25 @@ SCRIPT = BEGIN + r"""
 # 2026-10-17: adding a workspace from the remote web UI failed for a folder that does not exist yet ("Path does
 # not exist or is not accessible") - at the PC the Windows folder picker can create it. The daemon now creates it when
 # its parent exists and it is under C:\Users\user (one level only: a typo deep in a path creates nothing).
+#
+# 2026-10-21: that patch was dead in 0.25.0 - it called existsSync4, which the 0.25.0 server chunk does not
+# import (esbuild renamed it), so the ReferenceError was swallowed by the empty catch and every missing folder still
+# answered 400. Fixed here by importing fs helpers under lp- names that no build will rename, and by the new project
+# root: projects live on the local SSD under C:\ai_cache\projects\<name>, so anything inside C:\ai_cache may be
+# created at any depth; C:\Users\user stays one level deep.
 DAEMON_DIR = os.path.join(os.environ["APPDATA"], r"npm\node_modules\@qwen-code\qwen-code\chunks")
+LP_IMPORT = 'import{existsSync as lpExists,mkdirSync as lpMkdir}from"node:fs";'
 D_OLD = 'canonical=realpathSync3.native(resolve7(sandboxCwd))}catch{res.status(400).json({error:"Path does not exist or is not accessible",code:"invalid_path"});return}'
 D_NEW = ('canonical=realpathSync3.native(resolve7(sandboxCwd))}catch{/*lp-mkdir*/try{const p=resolve7(sandboxCwd);'
-         r'if(/^[a-z]:\\users\\user\\[^\\]/i.test(p)&&existsSync4(resolve7(p,".."))&&!existsSync4(p)){mkdirSync2(p);'
+         r'if(/^[a-z]:\\ai_cache\\[^\\]|^[a-z]:\\users\\user\\[^\\]+$/i.test(p)&&!lpExists(p)){lpMkdir(p,{recursive:true});'
          'canonical=realpathSync3.native(p)}}catch{}if(!canonical){res.status(400).json({error:"Path does not exist or is '
          'not accessible",code:"invalid_path"});return}}')
+# The 2026-10-17 patch as it was written - upgraded to D_NEW in place (its anchor is gone, so the loop below would
+# otherwise report "the code moved" and leave the broken one in place).
+D_BROKEN = ('canonical=realpathSync3.native(resolve7(sandboxCwd))}catch{/*lp-mkdir*/try{const p=resolve7(sandboxCwd);'
+            r'if(/^[a-z]:\\users\\user\\[^\\]/i.test(p)&&existsSync4(resolve7(p,".."))&&!existsSync4(p)){mkdirSync2(p);'
+            'canonical=realpathSync3.native(p)}}catch{}if(!canonical){res.status(400).json({error:"Path does not exist or is '
+            'not accessible",code:"invalid_path"});return}}')
 
 
 # 2026-10-18: compacted branches (qwen-compactor.py on 127.0.0.1:8085). The page asks /lp-compact/offer and
@@ -465,9 +478,12 @@ def patch_daemon(remove=False):
         path = os.path.join(DAEMON_DIR, name)
         with open(path, encoding="utf-8") as f:
             js = f.read()
-        if D_OLD not in js and D_NEW not in js:
+        if not any(a in js for a in (D_OLD, D_NEW, D_BROKEN)):
             continue
         done = []
+        if not remove and D_BROKEN in js and D_NEW not in js:
+            js = js.replace(D_BROKEN, D_NEW)
+            done.append("create a new workspace folder (replaced the dead 2026-10-17 mkdir)")
         for what, old, new in DAEMON_PATCHES:
             if remove and new in js:
                 js = js.replace(new, old)
@@ -479,6 +495,15 @@ def patch_daemon(remove=False):
             else:
                 continue
             done.append(what)
+        # lp-mkdir's fs helpers, with names esbuild cannot rename; the 2026-10-17 patch used existsSync4 and died on
+        # a ReferenceError swallowed by its own catch.
+        if not remove and "lpMkdir" in js and LP_IMPORT not in js:
+            i = js.index('"use strict";') + len('"use strict";')
+            js = js[:i] + "\n" + LP_IMPORT + js[i:]
+            done.append("lp fs import")
+        if remove and LP_IMPORT in js:
+            js = js.replace("\n" + LP_IMPORT, "", 1)
+            done.append("lp fs import")
         if done:
             with open(path, "w", encoding="utf-8", newline="") as f:
                 f.write(js)
