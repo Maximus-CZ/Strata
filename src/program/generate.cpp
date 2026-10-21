@@ -5219,6 +5219,15 @@ int main(int argc, char** argv) {
         // local patch (2026-10-18): endpoint=0 on a request - its conversation's end point is never written to disk
         // (SubSync's agents: short-lived, 38 GB of end points in a night; their shared system prompts still are)
         bool live_endpoint = true;
+        // local patch (2026-10-21, SSD wear): two agents taking turns parked each other on every request and each park
+        // wrote ~750 MB (a delta end point) to disk - per turn.  The RAM conversation cache holds the outgoing state
+        // anyway; the disk copy is only the fall-back for when RAM lets it go.  So an end point is written once the
+        // conversation has grown STRATA_ENDPOINT_GAP tokens (default 16384) past its newest saved one - a conversation
+        // that comes back from disk then reads at most that much again - or when the incoming request says flush=1
+        // (the held restart parks the live conversation that way, so a restart loses nothing).
+        bool flush_endpoint = false;
+        const int64_t endpoint_gap = [] { const char* v = std::getenv("STRATA_ENDPOINT_GAP");
+                                          return v && *v ? (int64_t) std::atoll(v) : (int64_t) 16384; }();
         auto park_current = [&](size_t held) -> bool {
             if (!conversations.enabled() || !live_ok || live.empty()) return true;
             // local patch (2026-10-15, conversation end points on disk): the outgoing conversation's end point - its
@@ -5239,11 +5248,18 @@ int main(int argc, char** argv) {
                 // user...) is worth a file - a first turn is usually a one-off (a SubSync verifier or whole-file
                 // question, a web_fetch summary: 13 x 855 MB in 3 min flushed the store); and a tail under 2048 tokens
                 // is read again in ~3 s, cheaper than writing and restoring 130+ MB
+                const int64_t saved_at = best ? prefixes.best(best->ids, best->imgs, cvec_cached).tokens : 0;
+                char deferred[160];
+                std::snprintf(deferred, sizeof deferred, "deferred - %lld tokens past the saved end point at %lld, "
+                              "under the %lld-token gap (the RAM cache keeps it)", (long long) (n_tail - saved_at),
+                              (long long) saved_at, (long long) endpoint_gap);
                 const char* why = !live_endpoint ? "the client asked for none (endpoint=0)"
                                 : !best ? "no checkpoint" : root_at <= 0 ? "no turn boundary"
                                 : turns < 4 ? "a first turn (saved once the conversation comes back)"
                                 : n_tail - root_at < 2048 ? "under 2048 tokens past the system prompt"
-                                : prefixes.contains(best->ids, best->imgs, cvec_cached) ? "already saved" : nullptr;
+                                : prefixes.contains(best->ids, best->imgs, cvec_cached) ? "already saved"
+                                : !flush_endpoint && saved_at - root_at >= 2048 && n_tail - saved_at < endpoint_gap ? deferred
+                                : nullptr;
                 if (why)
                     std::fprintf(stderr, "strata serve: prefix cache: end point not saved: %s (live %zu tokens, %zu "
                                  "checkpoint%s, deepest %lld)\n", why, live.size(), checks.size(),
@@ -6332,6 +6348,7 @@ int main(int argc, char** argv) {
             int req_penalty_last_n = 0;
             int req_cvec = 1;   // cvec=0|1: a loaded control vector for this request (on when absent)
             bool req_endpoint = true;   // endpoint=0|1: its end point to disk when it is parked
+            bool req_flush = false;     // flush=1: the conversation this request parks gets its end point written now
             // tuning keys (setup's calibration measures settings without restarting the engine): the PCIe share of
             // the missed experts and the draft-probability floor, for this request only
             double req_pcie_frac = o.pcie_frac, req_spec_min_p = o.spec_min_p;
@@ -6349,6 +6366,7 @@ int main(int argc, char** argv) {
                     const float fv = std::strtof(tok.c_str() + eq + 1, nullptr);
                     if (key == "cvec") req_cvec = std::atoi(tok.c_str() + eq + 1);
                     else if (key == "endpoint") req_endpoint = std::atoi(tok.c_str() + eq + 1) != 0;
+                    else if (key == "flush") req_flush = std::atoi(tok.c_str() + eq + 1) != 0;
                     else if (key == "temperature") req_temperature = fv;
                     else if (key == "top_p") req_top_p = fv;
                     else if (key == "top_k") req_top_k = std::atoi(tok.c_str() + eq + 1);
@@ -6581,11 +6599,13 @@ int main(int argc, char** argv) {
             }
             // Preserve the outgoing branch before any checkpoint rewind, reset,
             // or incoming restore overwrites the positional state it requires.
+            flush_endpoint = req_flush;
             if ((!from_live || incoming || slot_source >= 0 || prefix.tokens > 0) &&
                 !park_current(incoming ? incoming->bytes() : 0)) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
+            flush_endpoint = false;
             live_endpoint = req_endpoint;   // the outgoing conversation was parked with its own flag; now this one's
             if (slot_source >= 0) {
                 const auto t0 = Clock::now();

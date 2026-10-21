@@ -692,6 +692,8 @@ class StrataEngine:
             keys += f" seed={seed}"
         if sampling.get("_strata_endpoint") is False:   # local patch: no end point to disk for this conversation
             keys += " endpoint=0"
+        if sampling.get("_strata_flush") is True:       # local patch: the conversation this parks is written now
+            keys += " flush=1"
         # setup's calibration (tools/calibrate.py): engine settings for this request only, measured without a restart
         tune = sampling.get("strata_tune")
         if isinstance(tune, dict):
