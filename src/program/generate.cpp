@@ -5249,6 +5249,15 @@ int main(int argc, char** argv) {
                 // question, a web_fetch summary: 13 x 855 MB in 3 min flushed the store); and a tail under 2048 tokens
                 // is read again in ~3 s, cheaper than writing and restoring 130+ MB
                 const int64_t saved_at = best ? prefixes.best(best->ids, best->imgs, cvec_cached).tokens : 0;
+                // 2026-10-21: deferring is only safe while the outgoing state STAYS in RAM - parked next to the incoming
+                // image (`held`).  Two big conversations taking turns (2.6 GB each in a 4 GB cache) push each other out:
+                // then it is written as before, or the next switch would read everything since its last save again.
+                size_t out_bytes = 0;
+                const strata::core::ConversationView out_view{live, live_imgs, checks, cvec_cached};
+                const bool stays = stages.empty() &&
+                    strata::core::conversation_snapshot_bytes(out_view, ss, g, &mtp.kv_state(), out_bytes, err) &&
+                    held <= conversations.budget() && out_bytes <= conversations.budget() - held;
+                err.clear();
                 char deferred[160];
                 std::snprintf(deferred, sizeof deferred, "deferred - %lld tokens past the saved end point at %lld, "
                               "under the %lld-token gap (the RAM cache keeps it)", (long long) (n_tail - saved_at),
@@ -5258,7 +5267,8 @@ int main(int argc, char** argv) {
                                 : turns < 4 ? "a first turn (saved once the conversation comes back)"
                                 : n_tail - root_at < 2048 ? "under 2048 tokens past the system prompt"
                                 : prefixes.contains(best->ids, best->imgs, cvec_cached) ? "already saved"
-                                : !flush_endpoint && saved_at - root_at >= 2048 && n_tail - saved_at < endpoint_gap ? deferred
+                                : !flush_endpoint && stays && saved_at - root_at >= 2048 &&
+                                  n_tail - saved_at < endpoint_gap ? deferred
                                 : nullptr;
                 if (why)
                     std::fprintf(stderr, "strata serve: prefix cache: end point not saved: %s (live %zu tokens, %zu "

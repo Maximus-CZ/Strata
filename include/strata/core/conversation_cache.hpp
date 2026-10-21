@@ -166,6 +166,7 @@ public:
 
     ConversationCache(size_t budget, size_t slots) : budget_(budget), slots_(slots) {}
     bool enabled() const { return budget_ != 0 && slots_ != 0; }
+    size_t budget() const { return budget_; }   // local patch: park_current asks whether a conversation stays in RAM
     size_t bytes() const { return bytes_ + reuse_.bytes(); }
     size_t size() const { return entries_.size(); }
     size_t evictions() const { return evictions_; }
