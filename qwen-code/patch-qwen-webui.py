@@ -597,10 +597,52 @@ def patch_shell(remove=False):
     return False
 
 
+# 2026-10-21: web-shell/sw.js answers /assets/<hash>.js cache-first from Cache Storage, so a patched asset is
+# invisible to the browser - not on a reload, not on a hard reload (the service worker replies before any network).
+# Now network-first with the cache kept as the offline fallback, and the cache name bumped so the stale v1 copy is
+# dropped when the new worker activates. sw.js is not content-hashed, so it is served no-cache and the browser
+# re-checks it on the next navigation.
+SW_FILE = os.path.join(os.environ["APPDATA"], r"npm\node_modules\@qwen-code\qwen-code\web-shell\sw.js")
+SW_PATCHES = [("asset cache name v1 -> v2-lp (the stale cache is deleted on activate)",
+               'var r="0.25.0",s="qwen-code-shell-v1-"+r;',
+               'var r="0.25.0",s="qwen-code-shell-v2-lp-"+r;'),
+               ("assets served network-first, cache only as the offline fallback",
+                'async function c(n,t){var e;try{e=await caches.open(s);var i=await e.match(n);if(i)return i}catch{}'
+                'var a=await fetch(n);return e&&a.status===200&&a.type==="basic"&&t.waitUntil(e.put(n,a.clone())'
+                '.catch(function(){})),a}',
+                'async function c(n,t){var e;try{e=await caches.open(s)}catch{}try{var a=await fetch(n);'
+                'return e&&a.status===200&&a.type==="basic"&&t.waitUntil(e.put(n,a.clone()).catch(function(){})),a}'
+                'catch(o){if(e){var i=await e.match(n);if(i)return i}throw o}}')]
+
+
+def patch_sw(remove=False):
+    with open(SW_FILE, encoding="utf-8") as f:
+        js = f.read()
+    done = []
+    for what, old, new in SW_PATCHES:
+        a, b = (new, old) if remove else (old, new)
+        if b in js and a not in js:
+            print(f"sw: {what}: already " + ("removed" if remove else "patched"))
+            continue
+        if a in js:
+            js = js.replace(a, b)
+            done.append(what)
+        else:
+            print(f"sw: {what}: the code moved (check by hand)")
+    if done:
+        with open(SW_FILE, "w", encoding="utf-8", newline="") as f:
+            f.write(js)
+        print(f"sw {'unpatched' if remove else 'patched'} (" + ", ".join(done) + "): " + SW_FILE
+              + " - reload the page (the worker updates and drops the old cache)")
+        return True
+    return False
+
+
 def main():
     patch_daemon("--remove" in sys.argv)
     patch_core("--remove" in sys.argv)
     patch_shell("--remove" in sys.argv)
+    patch_sw("--remove" in sys.argv)
     with open(INDEX, encoding="utf-8") as f:
         html = f.read()
     if BEGIN in html:
