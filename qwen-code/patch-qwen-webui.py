@@ -532,7 +532,13 @@ def patch_daemon(remove=False):
 # this turn cannot own a Goal approval ...").
 CORE_PATCHES = [("propose_goal always declared (a stable tool list for the prompt cache)",
                  'return name!==ToolNames.PROPOSE_GOAL||this.config.isGoalProposalAvailable()}',
-                 'return true/*lp-stable-tools: name!==ToolNames.PROPOSE_GOAL||this.config.isGoalProposalAvailable()*/}')]
+                 'return true/*lp-stable-tools: name!==ToolNames.PROPOSE_GOAL||this.config.isGoalProposalAvailable()*/}'),
+                # 2026-10-21: a hashed Web Shell asset is served "max-age=31536000, immutable", so a patched asset
+                # (the add-workspace folder root) is never re-fetched - a plain reload keeps the old panel and only a
+                # hard reload breaks it. Revalidate instead: the browser asks, the ETag answers 304 when nothing changed.
+                ("web shell assets revalidate instead of being cached for a year",
+                 'contentAddressed?"public, max-age=31536000, immutable":"no-cache"',
+                 'contentAddressed/*lp-asset-cache*/?"public, max-age=0, must-revalidate":"no-cache"')]
 
 
 def patch_core(remove=False):
