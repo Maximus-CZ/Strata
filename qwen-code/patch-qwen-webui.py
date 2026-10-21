@@ -434,22 +434,27 @@ SCRIPT = BEGIN + r"""
 #
 # 2026-10-21: that patch was dead in 0.25.0 - it called existsSync4, which the 0.25.0 server chunk does not
 # import (esbuild renamed it), so the ReferenceError was swallowed by the empty catch and every missing folder still
-# answered 400. Fixed here by importing fs helpers under lp- names that no build will rename, and by the new project
-# root: projects live on the local SSD under C:\ai_cache\projects\<name>, so anything inside C:\ai_cache may be
-# created at any depth; C:\Users\user stays one level deep.
+# answered 400. Fixed here by importing fs helpers under lp- names that no build will rename. Scope: the panel's
+# selector offers the whole C:\Users\user tree, so the home folder is not the boundary - projects are standardised on
+# the local SSD under C:\ai_cache\projects\<name>, and only C:\ai_cache may be auto-created (at any depth: memories
+# and other material will sit next to a project). Anywhere else still answers 400.
 DAEMON_DIR = os.path.join(os.environ["APPDATA"], r"npm\node_modules\@qwen-code\qwen-code\chunks")
 LP_IMPORT = 'import{existsSync as lpExists,mkdirSync as lpMkdir}from"node:fs";'
 D_OLD = 'canonical=realpathSync3.native(resolve7(sandboxCwd))}catch{res.status(400).json({error:"Path does not exist or is not accessible",code:"invalid_path"});return}'
 D_NEW = ('canonical=realpathSync3.native(resolve7(sandboxCwd))}catch{/*lp-mkdir*/try{const p=resolve7(sandboxCwd);'
-         r'if(/^[a-z]:\\ai_cache\\[^\\]|^[a-z]:\\users\\user\\[^\\]+$/i.test(p)&&!lpExists(p)){lpMkdir(p,{recursive:true});'
+         r'if(/^[a-z]:\\ai_cache\\[^\\]/i.test(p)&&!lpExists(p)){lpMkdir(p,{recursive:true});'
          'canonical=realpathSync3.native(p)}}catch{}if(!canonical){res.status(400).json({error:"Path does not exist or is '
          'not accessible",code:"invalid_path"});return}}')
-# The 2026-10-17 patch as it was written - upgraded to D_NEW in place (its anchor is gone, so the loop below would
-# otherwise report "the code moved" and leave the broken one in place).
+# The 2026-10-17 patch as it was written (dead), and its first rewrite of 2026-10-21 that still let C:\Users\user
+# through - both are upgraded to D_NEW in place, so the loop below cannot report "the code moved" and leave them.
 D_BROKEN = ('canonical=realpathSync3.native(resolve7(sandboxCwd))}catch{/*lp-mkdir*/try{const p=resolve7(sandboxCwd);'
             r'if(/^[a-z]:\\users\\user\\[^\\]/i.test(p)&&existsSync4(resolve7(p,".."))&&!existsSync4(p)){mkdirSync2(p);'
             'canonical=realpathSync3.native(p)}}catch{}if(!canonical){res.status(400).json({error:"Path does not exist or is '
             'not accessible",code:"invalid_path"});return}}')
+D_WIDE = ('canonical=realpathSync3.native(resolve7(sandboxCwd))}catch{/*lp-mkdir*/try{const p=resolve7(sandboxCwd);'
+          r'if(/^[a-z]:\\ai_cache\\[^\\]|^[a-z]:\\users\\user\\[^\\]+$/i.test(p)&&!lpExists(p)){lpMkdir(p,{recursive:true});'
+          'canonical=realpathSync3.native(p)}}catch{}if(!canonical){res.status(400).json({error:"Path does not exist or is '
+          'not accessible",code:"invalid_path"});return}}')
 
 
 # 2026-10-18: compacted branches (qwen-compactor.py on 127.0.0.1:8085). The page asks /lp-compact/offer and
@@ -478,12 +483,14 @@ def patch_daemon(remove=False):
         path = os.path.join(DAEMON_DIR, name)
         with open(path, encoding="utf-8") as f:
             js = f.read()
-        if not any(a in js for a in (D_OLD, D_NEW, D_BROKEN)):
+        if not any(a in js for a in (D_OLD, D_NEW, D_BROKEN, D_WIDE)):
             continue
         done = []
-        if not remove and D_BROKEN in js and D_NEW not in js:
-            js = js.replace(D_BROKEN, D_NEW)
-            done.append("create a new workspace folder (replaced the dead 2026-10-17 mkdir)")
+        for older, note in ((D_BROKEN, "replaced the dead 2026-10-17 mkdir"),
+                            (D_WIDE, "narrowed the mkdir to C:\\ai_cache")):
+            if not remove and older in js and D_NEW not in js:
+                js = js.replace(older, D_NEW)
+                done.append("create a new workspace folder (" + note + ")")
         for what, old, new in DAEMON_PATCHES:
             if remove and new in js:
                 js = js.replace(new, old)
