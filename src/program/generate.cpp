@@ -5220,75 +5220,102 @@ int main(int argc, char** argv) {
         // (SubSync's agents: short-lived, 38 GB of end points in a night; their shared system prompts still are)
         bool live_endpoint = true;
         // local patch (2026-10-21, SSD wear): two agents taking turns parked each other on every request and each park
-        // wrote ~750 MB (a delta end point) to disk - per turn.  The RAM conversation cache holds the outgoing state
-        // anyway; the disk copy is only the fall-back for when RAM lets it go.  So an end point is written once the
-        // conversation has grown STRATA_ENDPOINT_GAP tokens (default 16384) past its newest saved one - a conversation
-        // that comes back from disk then reads at most that much again - or when the incoming request says flush=1
-        // (the held restart parks the live conversation that way, so a restart loses nothing).
+        // wrote ~750 MB (a delta end point) to disk - per turn.  Now a conversation's end point is written when the RAM
+        // conversation cache lets it go (on_evict, from its parked copy), when it is not parked after all, on a request
+        // with flush=1 (the live one AND every parked one: Qwen gone quiet, the held restart), and - a safety net for a
+        // crash - once it has grown STRATA_ENDPOINT_GAP tokens (default 65536) past its newest saved end point.
         bool flush_endpoint = false;
         const int64_t endpoint_gap = [] { const char* v = std::getenv("STRATA_ENDPOINT_GAP");
-                                          return v && *v ? (int64_t) std::atoll(v) : (int64_t) 16384; }();
+                                          return v && *v ? (int64_t) std::atoll(v) : (int64_t) 65536; }();
+        // the end point a conversation (its checkpoint chain) would get on disk, or why none
+        struct EndPick { const ConvCheckpoint* best = nullptr; int64_t n_tail = 0, root_at = -1; const char* why = nullptr; };
+        auto end_point = [&](const std::vector<ConvCheckpoint>& cks, bool may, bool cvec) -> EndPick {
+            EndPick e;
+            // the conversation's deepest checkpoint (not the last in the list: a restored root can sit there)
+            for (const ConvCheckpoint& c : cks) if (!e.best || c.ids.size() > e.best->ids.size()) e.best = &c;
+            e.n_tail = e.best ? (int64_t) e.best->ids.size() : 0;
+            int64_t turns = 0;
+            for (int64_t i = 1; i < e.n_tail; ++i)
+                if (e.best->ids[(size_t) i] == o.turn_token) { if (e.root_at < 0) e.root_at = i; }
+            for (int64_t i = 0; i < e.n_tail; ++i) turns += e.best->ids[(size_t) i] == o.turn_token;
+            // local patch (2026-10-16): only a conversation that already came back once (system, user, assistant,
+            // user...) is worth a file - a first turn is usually a one-off (a SubSync verifier or whole-file
+            // question, a web_fetch summary: 13 x 855 MB in 3 min flushed the store); and a tail under 2048 tokens
+            // is read again in ~3 s, cheaper than writing and restoring 130+ MB
+            e.why = !may ? "the client asked for none (endpoint=0)"
+                  : !e.best ? "no checkpoint" : e.root_at <= 0 ? "no turn boundary"
+                  : turns < 4 ? "a first turn (saved once the conversation comes back)"
+                  : e.n_tail - e.root_at < 2048 ? "under 2048 tokens past the system prompt"
+                  : prefixes.contains(e.best->ids, e.best->imgs, cvec) ? "already saved" : nullptr;
+            return e;
+        };
+        auto saved_log = [&](const EndPick& e, bool cvec, bool ok, const std::string& plog, const std::string& perr,
+                             Clock::time_point t0, const char* how) {
+            if (!ok) {
+                std::fprintf(stderr, "strata serve: prefix cache: end point not saved %s (%s)\n", how, perr.c_str());
+                return;
+            }
+            const size_t gone = prefixes.drop_superseded(e.best->ids, e.best->imgs, (size_t) e.root_at, cvec);
+            std::fprintf(stderr, "strata serve: prefix cache: conversation end point %lld tokens saved %s in %.0f ms (%s); "
+                         "%zu older end point%s dropped\n", (long long) e.n_tail, how,
+                         std::chrono::duration<double, std::milli>(Clock::now() - t0).count(), plog.c_str(), gone,
+                         gone == 1 ? "" : "s");
+        };
+        // a parked conversation's end point, from its RAM copy (evicted, or a flush)
+        auto save_image = [&](const strata::core::SavedConversation& img, const char* how) {
+            if (!prefixes.enabled() || !stages.empty() || o.turn_token < 0 || !img.stage_images.empty()) return;
+            const EndPick e = end_point(img.checkpoints, img.endpoint, img.cvec);
+            if (e.why) return;
+            std::string plog, perr;
+            const auto t0 = Clock::now();
+            const bool ok = prefixes.capture_image(*e.best, img, ss, g, mtp.kv_state(), plog, perr);
+            saved_log(e, img.cvec, ok, plog, perr, t0, how);
+        };
+        conversations.on_evict = [&](const strata::core::SavedConversation& img) { save_image(img, "as RAM lets it go"); };
         auto park_current = [&](size_t held) -> bool {
             if (!conversations.enabled() || !live_ok || live.empty()) return true;
             // local patch (2026-10-15, conversation end points on disk): the outgoing conversation's end point - its
-            // newest checkpoint - is also saved to the prefix cache before the RAM cache may evict it.  A subagent that
-            // comes back then restores it (system prompt + its whole context) instead of reading its history again,
-            // however many conversations rotate through the 4 RAM slots.  Its older end points go; the system-prompt
-            // root stays.  One GPU; pictures are keyed by content hash in the prefix file.
+            // newest checkpoint - goes to the prefix cache, so a conversation that comes back after RAM let it go restores
+            // it (system prompt + its whole context) instead of reading its history again.  Its older end points go;
+            // the system-prompt root stays.  One GPU; pictures are keyed by content hash in the prefix file.
+            // 2026-10-21: written now only when it will not sit in RAM (or on a flush / the crash net); else when RAM
+            // lets it go - and if parking fails below after all, `pending` writes it on the way out.
+            std::function<void()> pending;
             if (prefixes.enabled() && stages.empty() && o.turn_token >= 0) {
-                // the conversation's deepest checkpoint (not the last in the list: a restored root can sit there)
-                const ConvCheckpoint* best = nullptr;
-                for (const ConvCheckpoint& c : checks) if (!best || c.ids.size() > best->ids.size()) best = &c;
-                const int64_t n_tail = best ? (int64_t) best->ids.size() : 0;
-                int64_t root_at = -1, turns = 0;
-                for (int64_t i = 1; i < n_tail; ++i)
-                    if (best->ids[(size_t) i] == o.turn_token) { if (root_at < 0) root_at = i; }
-                for (int64_t i = 0; i < n_tail; ++i) turns += best->ids[(size_t) i] == o.turn_token;
-                // local patch (2026-10-16): only a conversation that already came back once (system, user, assistant,
-                // user...) is worth a file - a first turn is usually a one-off (a SubSync verifier or whole-file
-                // question, a web_fetch summary: 13 x 855 MB in 3 min flushed the store); and a tail under 2048 tokens
-                // is read again in ~3 s, cheaper than writing and restoring 130+ MB
-                const int64_t saved_at = best ? prefixes.best(best->ids, best->imgs, cvec_cached).tokens : 0;
-                // 2026-10-21: deferring is only safe while the outgoing state STAYS in RAM - parked next to the incoming
-                // image (`held`).  Two big conversations taking turns (2.6 GB each in a 4 GB cache) push each other out:
-                // then it is written as before, or the next switch would read everything since its last save again.
-                size_t out_bytes = 0;
+                const EndPick e = end_point(checks, live_endpoint, cvec_cached);
+                const int64_t saved_at = e.best ? prefixes.best(e.best->ids, e.best->imgs, cvec_cached).tokens : 0;
+                size_t out_bytes = 0;   // does it stay in RAM next to the incoming image (`held`)?
                 const strata::core::ConversationView out_view{live, live_imgs, checks, cvec_cached};
-                const bool stays = stages.empty() &&
+                const bool stays =
                     strata::core::conversation_snapshot_bytes(out_view, ss, g, &mtp.kv_state(), out_bytes, err) &&
                     held <= conversations.budget() && out_bytes <= conversations.budget() - held;
                 err.clear();
-                char deferred[160];
-                std::snprintf(deferred, sizeof deferred, "deferred - %lld tokens past the saved end point at %lld, "
-                              "under the %lld-token gap (the RAM cache keeps it)", (long long) (n_tail - saved_at),
-                              (long long) saved_at, (long long) endpoint_gap);
-                const char* why = !live_endpoint ? "the client asked for none (endpoint=0)"
-                                : !best ? "no checkpoint" : root_at <= 0 ? "no turn boundary"
-                                : turns < 4 ? "a first turn (saved once the conversation comes back)"
-                                : n_tail - root_at < 2048 ? "under 2048 tokens past the system prompt"
-                                : prefixes.contains(best->ids, best->imgs, cvec_cached) ? "already saved"
-                                : !flush_endpoint && stays && saved_at - root_at >= 2048 &&
-                                  n_tail - saved_at < endpoint_gap ? deferred
-                                : nullptr;
-                if (why)
-                    std::fprintf(stderr, "strata serve: prefix cache: end point not saved: %s (live %zu tokens, %zu "
-                                 "checkpoint%s, deepest %lld)\n", why, live.size(), checks.size(),
-                                 checks.size() == 1 ? "" : "s", (long long) n_tail);
-                if (!why) {
-                    const ConvCheckpoint& tail = *best;
+                auto write_live = [&, e]() {
                     std::string plog, perr;
                     const auto t0 = Clock::now();
-                    if (prefixes.capture(tail, cvec_cached, ss, g, mtp.kv_state(), plog, perr)) {
-                        const size_t gone = prefixes.drop_superseded(tail.ids, tail.imgs, (size_t) root_at, cvec_cached);
-                        std::fprintf(stderr, "strata serve: prefix cache: conversation end point %lld tokens saved in "
-                                     "%.0f ms (%s); %zu older end point%s dropped\n", (long long) n_tail,
-                                     std::chrono::duration<double, std::milli>(Clock::now() - t0).count(), plog.c_str(),
-                                     gone, gone == 1 ? "" : "s");
-                    } else {
-                        std::fprintf(stderr, "strata serve: prefix cache: end point not saved (%s)\n", perr.c_str());
-                    }
+                    const bool ok = prefixes.capture(*e.best, cvec_cached, ss, g, mtp.kv_state(), plog, perr);
+                    saved_log(e, cvec_cached, ok, plog, perr, t0, "");
+                };
+                if (e.why) {
+                    std::fprintf(stderr, "strata serve: prefix cache: end point not saved: %s (live %zu tokens, %zu "
+                                 "checkpoint%s, deepest %lld)\n", e.why, live.size(), checks.size(),
+                                 checks.size() == 1 ? "" : "s", (long long) e.n_tail);
+                } else if (flush_endpoint || !stays || e.n_tail - std::max(saved_at, e.root_at) >= endpoint_gap) {
+                    write_live();
+                } else {
+                    std::fprintf(stderr, "strata serve: prefix cache: end point deferred - parked in RAM, written when "
+                                 "RAM lets it go or on a flush (live %zu tokens, %lld past the saved end point at %lld)\n",
+                                 live.size(), (long long) (e.n_tail - std::max(saved_at, e.root_at)),
+                                 (long long) saved_at);
+                    pending = write_live;
                 }
             }
+            if (flush_endpoint)   // the parked ones too: nothing waits in RAM only when Qwen goes quiet or Strata restarts
+                conversations.for_each([&](const strata::core::SavedConversation& img) { save_image(img, "on a flush"); });
+            struct WriteIfNotParked {
+                std::function<void()>& f; bool parked = false;
+                ~WriteIfNotParked() { if (!parked && f) f(); }
+            } not_parked{pending};
             // #342: before make_room evicts oldest-first, the copies of this conversation a turn back go (they hold
             // nothing the outgoing chain does not, apart from the tail this conversation rewrote)
             if (const size_t dropped = conversations.drop_superseded(live, live_imgs, checks, cvec_cached))
@@ -5395,7 +5422,9 @@ int main(int argc, char** argv) {
                     return true;
                 }
                 const size_t snapshot_bytes = image.bytes();
+                image.endpoint = live_endpoint;
                 const bool stored = conversations.put(std::move(image), held);
+                not_parked.parked = stored;
                 std::fprintf(stderr, "strata serve: conversation cache: %s %zu tokens in %.1f ms; parked=%zu bytes=%zu evictions=%zu snapshot_bytes=%zu reused_kv_bytes=%zu\n",
                              stored ? "parked" : "skipped", live.size(),
                              std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),

@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -61,6 +62,10 @@ public:
     // (sampled), the file holds only the bytes past them and links to it - the chain is read back on restore.
     bool capture(const ConversationCheckpoint& root, bool cvec, const SessionState& session, const ModelGeometry& g,
                  const QsaState& draft, std::string& log, std::string& error);
+    // local patch (2026-10-21): the same file from a PARKED conversation (the RAM cache is letting it go) - `root`
+    // is one of its checkpoints, the bytes come from its K/V copies; the session only gives the layout.
+    bool capture_image(const ConversationCheckpoint& root, const SavedConversation& image, const SessionState& session,
+                       const ModelGeometry& g, const QsaState& draft, std::string& log, std::string& error);
     // `source`: "ram", "disk>ram" (read into the RAM tier first) or "disk" (streamed).  An invalid file is
     // deleted.  transfer_failed leaves the session partly written.
     ConversationRestore restore(uint64_t key, SessionState& session, const ModelGeometry& g, const QsaState& draft,
@@ -97,6 +102,12 @@ private:
     struct Span { const Entry* e; size_t at, n; };
     bool spans(const Entry& e, size_t j, size_t i, size_t at, size_t n, std::vector<Span>& out) const;
     uint64_t payload_at(const Entry& e, size_t j, size_t i) const;   // file offset of e's bytes of layer j payload i
+    using PayloadRead = std::function<bool(size_t, size_t, size_t, size_t, uint8_t*, std::string&)>;
+    using PayloadStream = std::function<bool(const std::vector<ConversationKvSizes>&, std::vector<uint8_t>&,
+                                             const ConversationWrite&, std::string&)>;
+    bool capture_from(const ConversationCheckpoint& root, bool cvec, const SessionState& session, const ModelGeometry& g,
+                      const QsaState& draft, const PayloadRead& read, const PayloadStream& stream, std::string& log,
+                      std::string& error);
     ConversationRestore restore_chain(const Entry& e, SessionState& session, const ModelGeometry& g,
                                       const QsaState& draft, std::string& source, std::string& error);
 

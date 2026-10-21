@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <utility>
 #include <vector>
 
@@ -128,6 +129,7 @@ struct SavedConversation {
     std::vector<ConversationCheckpoint> checkpoints;
     std::vector<ConversationKv> kv; // main layers followed by the draft layer
     bool cvec = true;
+    bool endpoint = true;   // local patch: its end point may go to disk (a request with endpoint=0: never)
     // with a layer split, the later stages' own images, one per stage, in stage order
     std::vector<SavedConversation> stage_images;
 
@@ -224,6 +226,7 @@ public:
         if (!enabled() || held > budget_ || incoming > budget_ - held) return false;
         if (bytes() > budget_ - held - incoming) reuse_ = {};
         while (!entries_.empty() && (entries_.size() >= slots_ || bytes_ > budget_ - held - incoming)) {
+            if (on_evict) on_evict(entries_.front());   // local patch: its last chance to reach the disk
             bytes_ -= entries_.front().bytes();
             entries_.pop_front();
             ++evictions_;
@@ -264,6 +267,11 @@ public:
         return dropped;
     }
     size_t superseded() const { return superseded_; }
+
+    // local patch (2026-10-21): called with each parked conversation just before RAM lets it go (make_room) - the
+    // engine writes its end point to disk then, instead of on every park
+    std::function<void(const SavedConversation&)> on_evict;
+    template<class Fn> void for_each(Fn fn) const { for (const auto& e : entries_) fn(e); }
 
     bool put(SavedConversation&& image, size_t held = 0) {
         const size_t n = image.bytes();

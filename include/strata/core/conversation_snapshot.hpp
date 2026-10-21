@@ -160,6 +160,14 @@ bool conversation_prefix_save_stream_from(const SessionState& session, const Mod
                                           std::string& error);
 bool conversation_prefix_read(const SessionState& session, const ModelGeometry& g, const QsaState& draft, int64_t upto,
                               size_t layer, size_t array, size_t at, size_t n, uint8_t* out, std::string& error);
+// local patch (2026-10-21, end points written on eviction): the same two, from a parked image's K/V copies (main
+// layers then the draft layer, arrays k, v, k_scale, v_scale, pooled - the order of the session's pools).  `sizes`:
+// the payload sizes of the prefix being written (conversation_prefix_header); each must lie inside the image's copy.
+bool conversation_prefix_save_stream_image(const SavedConversation& image, const std::vector<ConversationKvSizes>& sizes,
+                                           const std::vector<ConversationKvSizes>& from, const ConversationWrite& write,
+                                           std::string& error);
+bool conversation_prefix_read_image(const SavedConversation& image, const std::vector<ConversationKvSizes>& sizes,
+                                    size_t layer, size_t array, size_t at, size_t n, uint8_t* out, std::string& error);
 // conversation_prefix_restore_stream with the payloads in pieces that must tile every payload exactly
 ConversationRestore conversation_prefix_restore_pieces(const SavedConversation& meta,
                                                        const std::vector<ConversationKvSizes>& sizes,

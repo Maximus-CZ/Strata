@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstring>
 #include <limits>
 
 namespace strata::core {
@@ -398,6 +399,40 @@ bool conversation_prefix_save_stream_from(const SessionState& ss, const ModelGeo
                                               write, error))
             return false;
     return true;
+}
+
+namespace {
+std::array<const ConversationBuffer*, 5> image_arrays(const ConversationKv& kv) {
+    return {&kv.k, &kv.v, &kv.k_scale, &kv.v_scale, &kv.pooled};
+}
+}
+
+bool conversation_prefix_save_stream_image(const SavedConversation& image, const std::vector<ConversationKvSizes>& sizes,
+                                           const std::vector<ConversationKvSizes>& from, const ConversationWrite& write,
+                                           std::string& error) {
+    if (image.kv.size() != sizes.size() || from.size() != sizes.size())
+        return fail(error, "parked image: K/V layer count differs from the prefix");
+    for (size_t j = 0; j < sizes.size(); ++j) {
+        const auto src = image_arrays(image.kv[j]);
+        for (size_t i = 0; i < 5; ++i) {
+            if (from[j][i] > sizes[j][i]) return fail(error, "parked image: delta start past the payload");
+            if (sizes[j][i] > src[i]->size()) return fail(error, "parked image: shorter than the prefix");
+            if (sizes[j][i] > from[j][i] &&
+                !src[i]->visit(from[j][i], sizes[j][i] - from[j][i],
+                               [&](const uint8_t* p, size_t n, size_t) { return write(p, n); }))
+                return fail(error, "parked image: stream write failed");
+        }
+    }
+    return true;
+}
+
+bool conversation_prefix_read_image(const SavedConversation& image, const std::vector<ConversationKvSizes>& sizes,
+                                    size_t layer, size_t array, size_t at, size_t n, uint8_t* out, std::string& error) {
+    if (layer >= image.kv.size() || layer >= sizes.size() || array >= 5) return fail(error, "parked image: no such payload");
+    const ConversationBuffer* b = image_arrays(image.kv[layer])[array];
+    if (at > sizes[layer][array] || n > sizes[layer][array] - at || at + n > b->size())
+        return fail(error, "parked image: read past the payload");
+    return b->visit(at, n, [&](const uint8_t* p, size_t m, size_t off) { std::memcpy(out + (off - at), p, m); return true; });
 }
 
 bool conversation_prefix_read(const SessionState& ss, const ModelGeometry& g, const QsaState& draft, int64_t upto,

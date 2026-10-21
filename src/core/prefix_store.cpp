@@ -392,6 +392,33 @@ size_t PrefixStore::drop_superseded(const std::vector<int32_t>& ids, const std::
 
 bool PrefixStore::capture(const ConversationCheckpoint& root, bool cvec, const SessionState& ss,
                           const ModelGeometry& g, const QsaState& draft, std::string& log, std::string& error) {
+    const int64_t upto = (int64_t) root.ids.size();
+    return capture_from(root, cvec, ss, g, draft,
+        [&](size_t j, size_t i, size_t at, size_t n, uint8_t* out, std::string& e) {
+            return conversation_prefix_read(ss, g, draft, upto, j, i, at, n, out, e); },
+        [&](const std::vector<ConversationKvSizes>& from, std::vector<uint8_t>& bounce, const ConversationWrite& w,
+            std::string& e) { return conversation_prefix_save_stream_from(ss, g, draft, upto, from, bounce, w, e); },
+        log, error);
+}
+
+bool PrefixStore::capture_image(const ConversationCheckpoint& root, const SavedConversation& image,
+                                const SessionState& ss, const ModelGeometry& g, const QsaState& draft, std::string& log,
+                                std::string& error) {
+    SavedConversation meta;                        // the payload sizes of this prefix (the layout is the session's)
+    std::vector<ConversationKvSizes> sizes;
+    if (!enabled()) return true;
+    if (!conversation_prefix_header(meta, sizes, root, image.cvec, ss, g, draft, error)) return false;
+    return capture_from(root, image.cvec, ss, g, draft,
+        [&](size_t j, size_t i, size_t at, size_t n, uint8_t* out, std::string& e) {
+            return conversation_prefix_read_image(image, sizes, j, i, at, n, out, e); },
+        [&](const std::vector<ConversationKvSizes>& from, std::vector<uint8_t>&, const ConversationWrite& w,
+            std::string& e) { return conversation_prefix_save_stream_image(image, sizes, from, w, e); },
+        log, error);
+}
+
+bool PrefixStore::capture_from(const ConversationCheckpoint& root, bool cvec, const SessionState& ss,
+                               const ModelGeometry& g, const QsaState& draft, const PayloadRead& read,
+                               const PayloadStream& stream, std::string& log, std::string& error) {
     if (!enabled() || contains(root.ids, root.imgs, cvec)) return true;
     const auto t0 = Clock::now();
     SavedConversation meta;
@@ -472,7 +499,7 @@ bool PrefixStore::capture(const ConversationCheckpoint& root, bool cvec, const S
                             const size_t at = k == kSamples ? len - n : (len - n) / kSamples * k;
                             std::vector<Span> sp;
                             ok = spans(*base, j, i, at, n, sp) &&
-                                 conversation_prefix_read(ss, g, draft, upto, j, i, at, n, mine.data(), error);
+                                 read(j, i, at, n, mine.data(), error);
                             size_t got = 0;
                             for (const auto& x : sp) {   // spans come tail first
                                 if (!ok) break;
@@ -506,9 +533,7 @@ bool PrefixStore::capture(const ConversationCheckpoint& root, bool cvec, const S
         File w(tmp, "wb");
         ok = w.f && put_head(w, o_.identity, root.ids, root.imgs, cvec, parent) && put_meta(w, meta, sizes, from);
         if (ok) data_at = tell(w.f);
-        ok = ok && conversation_prefix_save_stream_from(ss, g, draft, upto, from, bounce,
-                                                        [&](const uint8_t* p, size_t n) { return w.put(p, n); },
-                                                        error) &&
+        ok = ok && stream(from, bounce, [&](const uint8_t* p, size_t n) { return w.put(p, n); }, error) &&
              w.close();
         if (!ok && error.empty()) error = "prefix cache: writing " + tmp + " failed";
     } catch (const std::bad_alloc&) {

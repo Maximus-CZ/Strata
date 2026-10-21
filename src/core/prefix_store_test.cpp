@@ -330,6 +330,50 @@ void prefix_session(int fmt, int mode, const std::string& dir) {
               again.restore(again.best(next,{},true).key,ss,g,draft.state,source,err)==ConversationRestore::restored &&
               restored(q4),"siblings: and it restores exactly");
     }
+    {   // local patch (2026-10-21): an end point written from a PARKED image, after the session moved on to another
+        // conversation (the RAM cache letting it go), is the same snapshot as one captured from the session at park time
+        const std::string adir=dir+"_gpu", bdir=dir+"_image";
+        fs::remove_all(adir); fs::remove_all(bdir);
+        PrefixStore::Options oa=o, ob=o;
+        oa.dir=adir; ob.dir=bdir; oa.ram_budget=ob.ram_budget=0;
+        PrefixStore a, b;
+        check(a.open(oa,log,err) && b.open(ob,log,err),"image: open");
+        ConversationCheckpoint r0; SavedConversation rr0;
+        at_root(13,40,r0,rr0);
+        check(a.capture(r0,true,ss,g,draft.state,log,err) && b.capture(r0,true,ss,g,draft.state,log,err),"image: roots");
+        check(b.restore(b.best(ids,{},true).key,ss,g,draft.state,source,err)==ConversationRestore::restored,
+              "image: the session at the root");
+        main.fill_after(66,40); draft.fill_after(66,40);
+        cuda_check(cudaDeviceSynchronize());
+        ConversationCheckpoint c; c.ids.assign(ids.begin(),ids.begin()+60);
+        check(conversation_checkpoint_save(c,ss,g,err) && conversation_checkpoint_restore(c,ss,g,err),"image: end point");
+        main.fill_after(67,60); draft.fill_after(67,60);   // the conversation goes on to 64 tokens
+        cuda_check(cudaDeviceSynchronize());
+        const std::vector<int32_t> live64(ids.begin(),ids.begin()+64);
+        SavedConversation parked;
+        {
+            const std::vector<ConversationCheckpoint> cks{c};
+            const ConversationView v{live64,none,cks,true};
+            check(conversation_snapshot_save(parked,v,ss,g,draft.state,err) && parked.checkpoints.size()==1,"image: parked");
+        }
+        check(a.capture(c,true,ss,g,draft.state,log,err),"image: the end point from the session (park time)");
+        fill(31);                                          // the session moves on to another conversation
+        check(b.capture_image(parked.checkpoints[0],parked,ss,g,draft.state,log,err) &&
+              log.find("a delta on 40")!=std::string::npos,"image: written from RAM, a delta on the root");
+        std::vector<int32_t> p61(ids.begin(),ids.begin()+61);
+        fill(32);
+        check(a.restore(a.best(p61,{},true).key,ss,g,draft.state,source,err)==ConversationRestore::restored,"image: a");
+        SavedConversation from_gpu;
+        {
+            const ConversationView v{c.ids,none,no_checks,true};
+            cuda_check(cudaDeviceSynchronize());
+            check(conversation_snapshot_save(from_gpu,v,ss,g,draft.state,err),"image: a's state");
+        }
+        fill(33);
+        check(b.restore(b.best(p61,{},true).key,ss,g,draft.state,source,err)==ConversationRestore::restored &&
+              restored(from_gpu),"image: restores to exactly the same state as the session's own capture");
+        fs::remove_all(adir); fs::remove_all(bdir);
+    }
     fs::remove_all(dir);
 }
 }
