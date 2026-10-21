@@ -560,9 +560,41 @@ def patch_core(remove=False):
             print(f"core: {what}: the code moved (check by hand)")
 
 
+# 2026-10-21: the Add Workspace panel opens at the parent of the daemon's primary workspace (Desktop -> C:\Users\user),
+# so its folder selector offers the whole home folder. Projects are standardised on the local SSD under
+# C:\ai_cache\projects\<name>, matching the mkdir scope the daemon accepts, so the panel starts there instead; the
+# old expression stays as the fallback. Served straight from disk - a page reload picks it up, no daemon restart.
+SHELL_DIR = os.path.join(os.environ["APPDATA"], r"npm\node_modules\@qwen-code\qwen-code\web-shell\assets")
+H_OLD = r'initialPath:Re.current?UE&&(St.capabilities?.workspaceCwd?.replace(/[^\\/]+[\\/]?$/,"")||St.capabilities?.workspaceCwd)||"/":void 0'
+H_NEW = (r'initialPath:Re.current?UE&&"C:\\ai_cache\\projects\\"/*lp-workspace-root*/||'
+         r'St.capabilities?.workspaceCwd?.replace(/[^\\/]+[\\/]?$/,"")||"/":void 0')
+
+
+def patch_shell(remove=False):
+    for name in os.listdir(SHELL_DIR):
+        if not name.endswith(".js"):
+            continue
+        path = os.path.join(SHELL_DIR, name)
+        with open(path, encoding="utf-8") as f:
+            js = f.read()
+        a, b = (H_NEW, H_OLD) if remove else (H_OLD, H_NEW)
+        if b in js and a not in js:
+            print("shell: add-workspace folder root: already " + ("removed" if remove else "patched"))
+            return True
+        if a in js:
+            with open(path, "w", encoding="utf-8", newline="") as f:
+                f.write(js.replace(a, b))
+            print(f"shell {'unpatched' if remove else 'patched'} (add-workspace folder root -> C:\\ai_cache\\projects): "
+                  + path + " - reload the page")
+            return True
+    print("shell: add-workspace folder root: the code moved (check by hand)")
+    return False
+
+
 def main():
     patch_daemon("--remove" in sys.argv)
     patch_core("--remove" in sys.argv)
+    patch_shell("--remove" in sys.argv)
     with open(INDEX, encoding="utf-8") as f:
         html = f.read()
     if BEGIN in html:
