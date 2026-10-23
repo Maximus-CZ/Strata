@@ -4,95 +4,95 @@ Oldest first. **commit**: what it does. *Why:* reason. `keywords`.
 
 **Base (upstream PR #960)**
 
-1. **730f983**: the prompt prefix is saved to disk, so a new chat restores its system prompt instead of reading it
+1. **4339695**: the prompt prefix is saved to disk, so a new chat restores its system prompt instead of reading it
    again. *Why:* a new chat starts in seconds instead of re-reading 30K+ tokens. `prefix-cache, disk, PR#960`
 
 **Engine: cache, end points, VRAM**
 
-2. **e1b4531**: `--prompt-cache 1` works together with `--prefix-cache-dir`. *Why:* the two options couldn't be
+2. **98a5d08**: `--prompt-cache 1` works together with `--prefix-cache-dir`. *Why:* the two options couldn't be
    combined. `prompt-cache, flags, compat`
-3. **8b0671f**: the vision encoder loads only when a picture arrives, borrowing VRAM from the expert cache. *Why:* image
+3. **fb86c51**: the vision encoder loads only when a picture arrives, borrowing VRAM from the expert cache. *Why:* image
    support without permanently losing 10 GB card space. `vision, lazy-load, VRAM`
-4. **6a0df09**: each conversation's state ("end point") is saved to disk, pictures are keyed by content, and the vision
+4. **c08cbe0**: each conversation's state ("end point") is saved to disk, pictures are keyed by content, and the vision
    encoder stays warm. *Why:* resuming a conversation after a restart or switch doesn't re-read it.
    `end-points, snapshots, picture-hash`
-5. **2a1dcee**: a saved state is stored only as the part beyond an older saved state of the same conversation (a
+5. **ba7353a**: a saved state is stored only as the part beyond an older saved state of the same conversation (a
    "delta"). *Why:* stops full multi-GB copies per turn. `delta, disk-space, STRPFX03`
-6. **2dd50e3**: if the closest base doesn't match byte for byte, the next-closest base is tried. *Why:* a mismatched
+6. **fb38554**: if the closest base doesn't match byte for byte, the next-closest base is tried. *Why:* a mismatched
    base no longer forces a full read. `delta, fallback, robustness`
-7. **0b03feb**: first turns and tails under 2048 tokens get no file, and a delta's base must be a clean prefix.
+7. **50c5090**: first turns and tails under 2048 tokens get no file, and a delta's base must be a clean prefix.
    *Why:* fewer pointless small writes, and no broken bases. `thresholds, SSD-wear, correctness`
-8. **6e3f0fd**: the vision encoder's VRAM baseline is measured only from the loaded engine and reset on every start.
+8. **0f54d0d**: the vision encoder's VRAM baseline is measured only from the loaded engine and reset on every start.
    *Why:* a stale baseline mis-sized the expert cache. `VRAM, baseline, vision`
-9. **0cc741b**: VRAM is regrown until the expert cache is full, picture encoding shows as a status, and every big read
+9. **58dd19d**: VRAM is regrown until the expert cache is full, picture encoding shows as a status, and every big read
    is logged with its reason. *Why:* get speed back after vision use, and make slow reads explainable.
    `VRAM-regrow, expert-cache, logging`
-10. **99d15f4**: the VRAM regrow is retried before a request while the expert cache is short. *Why:* the first regrow
+10. **c4d44ee**: the VRAM regrow is retried before a request while the expert cache is short. *Why:* the first regrow
     often failed while memory was still held. `regrow, retry, VRAM`
-11. **079c9d2**: the retry grows straight to the floor instead of shrinking first. *Why:* it shrank to a stale figure
+11. **d71edd6**: the retry grows straight to the floor instead of shrinking first. *Why:* it shrank to a stale figure
     and lost cache. `regrow, bugfix`
-12. **1376689**: the regrow floor is lowered from 384 to 256 MiB. *Why:* fits more experts on the 10 GB card.
+12. **e199e53**: the regrow floor is lowered from 384 to 256 MiB. *Why:* fits more experts on the 10 GB card.
     `VRAM, tuning`
-13. **4924b17**: the prefix store evicts the largest family first, and encoded pictures survive restarts. *Why:* keeps
+13. **2ffd5da**: the prefix store evicts the largest family first, and encoded pictures survive restarts. *Why:* keeps
     many small conversations instead of one huge one, and pictures aren't re-encoded.
     `eviction, prefix-store, pictures`
-14. **bba1328**: a request flag (`endpoint=0`) skips saving to disk, and the config's `endpoint_clients` decides which
+14. **edeb50c**: a request flag (`endpoint=0`) skips saving to disk, and the config's `endpoint_clients` decides which
     clients save. *Why:* background jobs (SubSync, compactions) shouldn't wear the SSD.
     `endpoint=0, per-client, SSD-wear`
-15. **aec3cd3** *(superseded by 17)*: states were written only after 16K tokens of growth or on a flush request.
+15. **f471a7f** *(superseded by 17)*: states were written only after 16K tokens of growth or on a flush request.
     *Why:* two agents taking turns were writing about 750 MB per turn. `STRATA_ENDPOINT_GAP, SSD-wear`
-16. **a3f709e** *(superseded by 17)*: writing was deferred only while the outgoing state stays in RAM. *Why:* two big
+16. **a6389d6** *(superseded by 17)*: writing was deferred only while the outgoing state stays in RAM. *Why:* two big
     conversations evicted each other and re-read their gaps. `deferral, RAM, regression-fix`
-17. **f104d8a**: a conversation's state is written to disk only when RAM evicts it, on a flush, or when it isn't kept
+17. **dd2a9ed**: a conversation's state is written to disk only when RAM evicts it, on a flush, or when it isn't kept
     in RAM, not on every switch. *Why:* "save on RAM eviction", which cuts SSD wear without extra re-reads.
     `on_evict, capture_image, SSD-wear`
 
 **Server: status, diagnostics, control**
 
-18. **725625c**: live status while a request waits for the model or its prompt is being read. *Why:* the UI showed
+18. **222defd**: live status while a request waits for the model or its prompt is being read. *Why:* the UI showed
     nothing during long reads. `status, UX`
-19. **cb307d9**: `/status/line` works without the key and shows prompt-read progress, with no status lines leaking
+19. **d1349b8**: `/status/line` works without the key and shows prompt-read progress, with no status lines leaking
     into the thinking text. *Why:* a status bar for the tray and web UI, with clean model output.
     `status-line, progress`
-20. **e1e96c9**: `/status/line` returns its numbers as separate fields. *Why:* a steady display that doesn't parse
+20. **8393206**: `/status/line` returns its numbers as separate fields. *Why:* a steady display that doesn't parse
     text. `API, status-fields`
-21. **04d12bf**: a request that reuses 2048+ fewer tokens than one cached before is logged. *Why:* cache misses become
+21. **56d058a**: a request that reuses 2048+ fewer tokens than one cached before is logged. *Why:* cache misses become
     visible and debuggable. `cache-miss, diagnostics`
-22. **2e9ed44**: a changed system prompt or tool list is named as the cause before "cache miss". *Why:* the cause shows
+22. **0532746**: a changed system prompt or tool list is named as the cause before "cache miss". *Why:* the cause shows
     instead of just the symptom. `cache-miss, root-cause`
-23. **31a131f**: `POST /strata/cancel {client}` cancels that client's running and queued requests. *Why:* SubSync can
+23. **4a8b3d3**: `POST /strata/cancel {client}` cancels that client's running and queued requests. *Why:* SubSync can
     be stopped at once when Qwen needs the model. `cancel, priority, SubSync`
-24. **d9406ba**: a compression requested in the last user message is shown as "compressing", not "answering".
+24. **b96671b**: a compression requested in the last user message is shown as "compressing", not "answering".
     *Why:* the status was wrong during compaction. `compaction, status, request_kind`
 
 **Qwen Code web UI** (`qwen-code/patch-qwen-webui.py`)
 
-25. **a975fc4**: local Qwen patches tracked in the repo, and side tasks, branches and forks allowed in every trusted
+25. **1f3945e**: local Qwen patches tracked in the repo, and side tasks, branches and forks allowed in every trusted
     workspace. *Why:* reproducible patches, and side tasks beyond one folder. `patch-tracking, side-tasks, trusted`
-26. **b6f72ff**: the page reports "in use" once a minute while visible and touched. *Why:* the PC was sleeping during
+26. **8b99be0**: the page reports "in use" once a minute while visible and touched. *Why:* the PC was sleeping during
     remote use. `keep-awake, compactor`
-27. **57e7cb3**: the status bar names the tool Qwen is waiting for and for how long. *Why:* "model idle" was
+27. **a2b5297**: the status bar names the tool Qwen is waiting for and for how long. *Why:* "model idle" was
     misleading. `status, tool-wait, timer`
-28. **5b7779c**: tools still running are also found in the transcript read after a page reload. *Why:* the waiting
+28. **5d921a9**: tools still running are also found in the transcript read after a page reload. *Why:* the waiting
     status was lost on reload. `reload, tool-tracking`
-29. **7d37342**: `propose_goal` is always declared. *Why:* a Goal starting or ending changed the tool list, which
+29. **0f0e7ed**: `propose_goal` is always declared. *Why:* a Goal starting or ending changed the tool list, which
     invalidated Strata's cache. `stable-tools, cache`
-30. **196b25d**: the compacted/uncompacted choice sits on the message box only. *Why:* it covered the end of the
+30. **7a6f8a9**: the compacted/uncompacted choice sits on the message box only. *Why:* it covered the end of the
     agent's reply. `compaction-UI, layout`
-31. **00c01a6**: the chosen branch opens in place, without a page reload, and Qwen's context pie updates at once.
+31. **5ee4717**: the chosen branch opens in place, without a page reload, and Qwen's context pie updates at once.
     *Why:* smoother switching with a correct context number. `no-reload, context-pie`
-32. **6b6f7b1**: a banner appears when the Authentik sign-in has expired. *Why:* requests otherwise failed as an
+32. **533cf3d**: a banner appears when the Authentik sign-in has expired. *Why:* requests otherwise failed as an
     unexplained NetworkError. `auth, banner`
-33. **e00a4c8**: the mkdir patch was silently dead in Qwen 0.25.0 and is fixed; projects can be created at any depth
+33. **5d73dbb**: the mkdir patch was silently dead in Qwen 0.25.0 and is fixed; projects can be created at any depth
     under `C:\ai_cache` on the local SSD. *Why:* creating a project folder from the UI didn't work.
     `mkdir, bugfix, ai_cache`
-34. **178b213**: the mkdir scope is limited to `C:\ai_cache`. *Why:* the whole home folder was too wide a boundary.
+34. **70f00b5**: the mkdir scope is limited to `C:\ai_cache`. *Why:* the whole home folder was too wide a boundary.
     `scope, safety`
-35. **a50ba1e**: the Add Workspace panel opens at `C:\ai_cache\projects`. *Why:* it opened at all of `C:\Users\user`,
+35. **1dca3a1**: the Add Workspace panel opens at `C:\ai_cache\projects`. *Why:* it opened at all of `C:\Users\user`,
     which doesn't match the mkdir scope. `workspace-picker, UX`
-36. **fae9eaa**: the web shell's files are revalidated on each load instead of cached as immutable for a year.
+36. **fa54526**: the web shell's files are revalidated on each load instead of cached as immutable for a year.
     *Why:* a patched file now takes effect on a plain reload. `cache-headers, deploy`
-37. **db42b21**: the service worker fetches from the network first, with the cache only as offline fallback, and the
+37. **e9e28cd**: the service worker fetches from the network first, with the cache only as offline fallback, and the
     cache name is bumped. *Why:* stale patched files survived even a hard reload. `service-worker, cache-busting`
 
 The list has 37 entries because entry 1 is the upstream PR the branch is built on and isn't counted among the 36.
