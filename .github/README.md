@@ -1,18 +1,6 @@
-# local patched Strata (since 2026-10-05)
+# Changes to upstream main
 
-This fork's default branch **`patched`** = upstream [Niko1221/Strata](https://github.com/Niko1221/Strata) `main` +
-36 patch commits (`git log --oneline origin/main..patched`). Upstream's own readme is unchanged in
-[README.md](../README.md); this page is `.github/README.md`, which GitHub shows first and upstream does not have, so
-updates never conflict with it. **Pull requests to upstream are cut from `main`, never from `patched`**, so this file
-never goes into one.
-
-Locally: `C:\Strata` (remote `origin` = upstream, `fork` = this repo). The engine in `engine\` is **compiled
-here** (engine/BUILD.json `"source": "local"`, sm_86 = RTX 3080, CUDA 13.1, vision encoder included), not the
-ready-made release.
-
-## Every patch at a glance (oldest first; as of 2026-10-23)
-
-Format: **commit**: what it does. *Why:* reason. `keywords`.
+Oldest first. **commit**: what it does. *Why:* reason. `keywords`.
 
 **Base (upstream PR #960)**
 
